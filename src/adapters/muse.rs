@@ -25,7 +25,7 @@ pub fn parse(event_name: &str, value: &Value) -> crate::event::ToolEvent {
 pub fn render(event_name: &str, outcome: &PolicyOutcome) -> Value {
     match event_name {
         "PreToolUse" => render_pre(outcome),
-        "PostToolUse" => cursor::render("postToolUse", outcome),
+        "PostToolUse" => render_post(outcome),
         other => cursor::render(other, outcome),
     }
 }
@@ -33,22 +33,44 @@ pub fn render(event_name: &str, outcome: &PolicyOutcome) -> Value {
 fn render_pre(outcome: &PolicyOutcome) -> Value {
     match &outcome.applied {
         Decision::Allow => json!({
-            "hookSpecificOutput": { "permissionDecision": "allow" }
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
         }),
         Decision::Deny { agent_message, .. } => json!({
             "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
                 "permissionDecisionReason": agent_message
             }
         }),
         Decision::Rewrite { updated_input, .. } => json!({
             "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
                 "permissionDecision": "allow",
                 "updatedInput": updated_input
             }
         }),
         Decision::ReplaceOutput { .. } => json!({
-            "hookSpecificOutput": { "permissionDecision": "allow" }
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        }),
+    }
+}
+
+fn render_post(outcome: &PolicyOutcome) -> Value {
+    match &outcome.applied {
+        Decision::Allow => json!({}),
+        Decision::Deny { .. } => json!({}),
+        Decision::Rewrite { .. } => json!({}),
+        Decision::ReplaceOutput { text, .. } => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": text
+            }
         }),
     }
 }
@@ -73,6 +95,26 @@ mod tests {
         };
         let reply = render("PreToolUse", &outcome);
         assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert!(reply.get("permission").is_none());
+    }
+
+    #[test]
+    fn post_clip_uses_hook_specific_output() {
+        let outcome = PolicyOutcome {
+            raw: Decision::ReplaceOutput {
+                text: "clipped".into(),
+                rule_id: "clip.output".into(),
+            },
+            applied: Decision::ReplaceOutput {
+                text: "clipped".into(),
+                rule_id: "clip.output".into(),
+            },
+            rule_id: Some("clip.output".into()),
+        };
+        let reply = render("PostToolUse", &outcome);
+        assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert_eq!(reply["hookSpecificOutput"]["updatedToolOutput"], "clipped");
+        assert!(reply.get("updated_mcp_tool_output").is_none());
     }
 }

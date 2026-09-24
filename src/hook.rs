@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::adapters;
 use crate::event::Harness;
@@ -36,20 +36,88 @@ pub struct HookEnv {
     pub paths: HookPaths,
     pub policy_override: Option<String>,
     pub telemetry_enabled: bool,
+    pub record_dir: Option<PathBuf>,
 }
 
 impl HookEnv {
     #[must_use]
     pub fn from_process() -> Self {
+        Self::from_process_with_record(None)
+    }
+
+    #[must_use]
+    pub fn from_process_with_record(cli_record: Option<PathBuf>) -> Self {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
+        let record_dir =
+            cli_record.or_else(|| std::env::var("TOOLGATE_RECORD_DIR").ok().map(PathBuf::from));
         Self {
             paths: HookPaths::from_home(&home),
             policy_override: std::env::var("TOOLGATE_POLICY").ok(),
             telemetry_enabled: std::env::var("TOOLGATE_TELEMETRY").ok().as_deref() != Some("0"),
+            record_dir,
         }
     }
+}
+
+const RECORD_TRUNCATE: usize = 200;
+
+/// Redact stdin payloads before fixture capture (truncate bulky fields).
+#[must_use]
+pub fn redact_payload_for_record(value: &Value) -> Value {
+    fn walk(v: &Value, key: Option<&str>) -> Value {
+        match v {
+            Value::Object(map) => {
+                let mut out = Map::new();
+                for (k, val) in map {
+                    out.insert(k.clone(), walk(val, Some(k.as_str())));
+                }
+                Value::Object(out)
+            }
+            Value::Array(arr) => Value::Array(arr.iter().map(|item| walk(item, key)).collect()),
+            Value::String(s) => {
+                let bulky = key.is_some_and(|k| {
+                    matches!(
+                        k,
+                        "tool_output"
+                            | "output"
+                            | "result_json"
+                            | "text"
+                            | "content"
+                            | "tool_input"
+                    )
+                });
+                if bulky && s.len() > RECORD_TRUNCATE {
+                    Value::String(format!("{}…", &s[..RECORD_TRUNCATE]))
+                } else {
+                    Value::String(s.clone())
+                }
+            }
+            _ => v.clone(),
+        }
+    }
+    walk(value, None)
+}
+
+fn append_record(
+    harness: Harness,
+    event_name: &str,
+    payload: &Value,
+    dir: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let stem = format!("{}-{}", harness.file_stem(), event_name);
+    let path = dir.join(format!("{stem}.jsonl"));
+    let redacted = redact_payload_for_record(payload);
+    let line = serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".into());
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
 }
 
 /// Legacy Cursor read hook types (re-exported for tests).
@@ -178,7 +246,12 @@ where
         Err(_) => adapters::allow_reply(harness, event_name),
         Ok(_) => match serde_json::from_str::<Value>(&buf) {
             Err(_) => adapters::allow_reply(harness, event_name),
-            Ok(value) => run_hook(harness, event_name, &value, env),
+            Ok(value) => {
+                if let Some(dir) = &env.record_dir {
+                    let _ = append_record(harness, event_name, &value, dir);
+                }
+                run_hook(harness, event_name, &value, env)
+            }
         },
     };
     emit_json(&mut writer, &reply)
@@ -197,8 +270,12 @@ fn run_hook(harness: Harness, event_name: &str, value: &Value, env: &HookEnv) ->
 }
 
 /// Read stdin, run policy hook, print one JSON object (exit 0).
-pub fn hook_stdio(harness: Harness, event_name: &str) -> std::io::Result<()> {
-    let env = HookEnv::from_process();
+pub fn hook_stdio(
+    harness: Harness,
+    event_name: &str,
+    record_dir: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let env = HookEnv::from_process_with_record(record_dir);
     hook_stdio_with(
         harness,
         event_name,
@@ -210,7 +287,7 @@ pub fn hook_stdio(harness: Harness, event_name: &str) -> std::io::Result<()> {
 
 /// Legacy cursor-read entry (delegates to unified hook).
 pub fn cursor_read_stdio() -> std::io::Result<()> {
-    hook_stdio(Harness::Cursor, "preToolUse")
+    hook_stdio(Harness::Cursor, "preToolUse", None)
 }
 
 /// Testable legacy cursor-read with env override.
@@ -248,6 +325,7 @@ mod tests {
             paths: HookPaths::from_home(&home),
             policy_override: None,
             telemetry_enabled: false,
+            record_dir: None,
         };
         let cwd = dir.path().to_string_lossy();
         let input =
@@ -279,6 +357,7 @@ mod tests {
             paths: HookPaths::from_home(&home),
             policy_override: None,
             telemetry_enabled: false,
+            record_dir: None,
         };
         let cwd = dir.path().to_string_lossy();
         let input =
@@ -303,6 +382,7 @@ mod tests {
             paths: HookPaths::from_home(home.path()),
             policy_override: None,
             telemetry_enabled: false,
+            record_dir: None,
         };
         let mut out = Vec::new();
         hook_stdio_with(
@@ -332,5 +412,35 @@ mod tests {
         };
         let out = legacy::decide_cursor_read(&input, None);
         assert_eq!(out.permission, "deny");
+    }
+
+    #[test]
+    fn record_appends_redacted_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+        let record_dir = dir.path().join("captures");
+        let env = HookEnv {
+            paths: HookPaths::from_home(&home),
+            policy_override: None,
+            telemetry_enabled: false,
+            record_dir: Some(record_dir.clone()),
+        };
+        let big = "y".repeat(500);
+        let input = format!(
+            r#"{{"tool_name":"Read","tool_input":{{"path":"a.txt"}},"tool_output":"{big}"}}"#
+        );
+        let mut out = Vec::new();
+        hook_stdio_with(
+            Harness::Cursor,
+            "preToolUse",
+            input.as_bytes(),
+            &mut out,
+            &env,
+        )
+        .expect("stdio");
+        let log = std::fs::read_to_string(record_dir.join("cursor-preToolUse.jsonl")).expect("log");
+        assert!(log.contains('…'));
+        assert!(!log.contains(&big));
     }
 }

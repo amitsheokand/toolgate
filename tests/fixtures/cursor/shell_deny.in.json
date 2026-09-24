@@ -1,1 +1,6 @@
-{"tool_name":"Shell","tool_input":{"command":"rm -rf /tmp/x"},"cwd":"/tmp/ws"}
+{
+  "hook_event_name": "preToolUse",
+  "tool_name": "Shell",
+  "tool_input": { "command": "rm -rf /tmp/x" },
+  "cwd": "/tmp/ws"
+}

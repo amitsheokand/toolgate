@@ -13,6 +13,18 @@ pub enum Harness {
     Pi,
 }
 
+impl Harness {
+    #[must_use]
+    pub fn file_stem(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::Muse => "muse",
+            Self::Opencode => "opencode",
+            Self::Pi => "pi",
+        }
+    }
+}
+
 /// Hook phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

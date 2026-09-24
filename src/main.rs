@@ -98,6 +98,9 @@ enum Command {
         /// Legacy alias for Cursor read cap (`preToolUse`).
         #[arg(long, hide = true)]
         cursor_read: bool,
+        /// Append redacted stdin payloads to `DIR/<harness>-<event>.jsonl` (also `TOOLGATE_RECORD_DIR`).
+        #[arg(long)]
+        record: Option<std::path::PathBuf>,
     },
     /// Exact-string edit that returns its diff (no re-read needed).
     Edit {
@@ -159,6 +162,7 @@ async fn main() -> Result<()> {
             harness,
             event,
             cursor_read,
+            record,
         } => {
             let harness = if cursor_read {
                 toolgate::event::Harness::Cursor
@@ -172,7 +176,7 @@ async fn main() -> Result<()> {
             } else {
                 event
             };
-            if toolgate::hook::hook_stdio(harness, &event).is_err() {
+            if toolgate::hook::hook_stdio(harness, &event, record).is_err() {
                 let allow = toolgate::adapters::allow_reply(harness, &event);
                 println!(
                     "{}",

@@ -27,16 +27,34 @@ toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]
 toolgate run <program> [args...] [--root <dir>] [--timeout S]
 toolgate serve --stdio   # MCP: read, edit, run (annotated hints)
 toolgate hook --harness cursor --event preToolUse   # stdio JSON hook
+toolgate hook --harness cursor --event preToolUse --record ./captures
 ```
 
 Legacy: `toolgate hook --cursor-read` → Cursor `preToolUse`.
+
+### Recording fixtures from live harnesses
+
+`--record DIR` (or `TOOLGATE_RECORD_DIR`) appends each redacted stdin payload to
+`DIR/<harness>-<event>.jsonl` (long `tool_output` / `output` fields truncated to
+200 chars) while still printing the normal hook reply on stdout. Wire the hook
+command in each harness, exercise the tool once, then copy lines from the JSONL
+into `tests/fixtures/<harness>/`:
+
+| Harness | Hook command | Typical `--event` |
+| --- | --- | --- |
+| Cursor | `toolgate hook --harness cursor --event …` | `preToolUse`, `postToolUse`, `afterShellExecution` |
+| Muse | `toolgate hook --harness muse --event …` | `PreToolUse`, `PostToolUse` |
+| OpenCode | shim calls `toolgate hook --harness opencode` | `tool.execute.before` / `after` |
+| Pi | shim calls `toolgate hook --harness pi` | `tool_call`, `tool_result` |
+
+Cursor payloads should include both `hook_event_name` and `tool_name` (common schema).
 
 ## Adapter matrix
 
 | Harness | Hook events | Deny / rewrite (pre) | Replace output (post) | Source |
 | --- | --- | --- | --- | --- |
 | Cursor | `preToolUse`, `postToolUse`, `afterShellExecution`, `afterMCPExecution` | preToolUse | postToolUse MCP only (`updated_mcp_tool_output`); shell/MCP after-hooks telemetry only | [Cursor hooks](https://cursor.com/docs/agent/hooks) |
-| Muse | `PreToolUse`, `PostToolUse` | `hookSpecificOutput` on PreToolUse | PostToolUse MCP (Cursor-shaped) | Muse settings (Claude Code–compatible JSON) |
+| Muse | `PreToolUse`, `PostToolUse` | `hookSpecificOutput` + `hookEventName` on PreToolUse | PostToolUse `updatedToolOutput` in `hookSpecificOutput` | Muse settings (Claude Code–compatible JSON) |
 | OpenCode | `tool.execute.before/after` | deny throws; `args` rewrite | after `output` field | OpenCode plugin (`adapters/opencode/toolgate-hook.mjs`) |
 | Pi | `tool_call` / `tool_result` | `{ block, reason }` on tool_call | `content` on tool_result | Pi `ExtensionAPI` ([extensions docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)) |
 

@@ -28,29 +28,18 @@ pub fn parse(event_name: &str, value: &Value) -> ToolEvent {
     };
     let mut args = NormalizedArgs::default();
     let input = value.get("input").cloned();
-    args.raw_input = input.clone();
+    let details = value.get("details").cloned();
+    args.raw_input = input.clone().or(details.clone());
+    args.command = command_of_pi(value);
     if let Some(obj) = input.and_then(|v| v.as_object().cloned()) {
         args.path = obj.get("path").and_then(|v| v.as_str()).map(str::to_owned);
         args.offset = obj.get("offset").and_then(|v| v.as_u64());
         args.limit = obj.get("limit").and_then(|v| v.as_u64());
-        args.command = obj
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-        if let Some(tr) = obj.get("then_run").and_then(|v| v.as_str()) {
-            if args.command.is_none() {
-                args.command = Some(tr.to_owned());
-            }
-        }
-    }
-    if let Some(details) = value.get("details") {
-        if args.raw_input.is_none() {
-            args.raw_input = Some(details.clone());
-        }
         if args.command.is_none() {
-            if let Some(cmd) = details.get("command").and_then(Value::as_str) {
-                args.command = Some(cmd.to_owned());
-            }
+            args.command = obj
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
         }
     }
     let output = value
@@ -81,6 +70,40 @@ pub fn parse(event_name: &str, value: &Value) -> ToolEvent {
             .unwrap_or(".")
             .to_owned(),
     }
+}
+
+/// Match `epr.ts` `commandOf` precedence for fused `then_run` shells.
+fn command_of_pi(value: &Value) -> Option<String> {
+    let details = value.get("details").and_then(|v| v.as_object());
+    if let Some(tr) = details
+        .and_then(|d| d.get("then_run"))
+        .and_then(Value::as_str)
+    {
+        if !tr.trim().is_empty() {
+            return Some(tr.trim().to_owned());
+        }
+    }
+    let input = value.get("input").and_then(|v| v.as_object());
+    if let Some(tr) = input.and_then(|i| i.get("then_run")) {
+        if let Some(obj) = tr.as_object() {
+            if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
+                return Some(cmd.to_owned());
+            }
+        }
+        if let Some(s) = tr.as_str() {
+            return Some(s.to_owned());
+        }
+    }
+    input
+        .and_then(|i| i.get("command"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            details
+                .and_then(|d| d.get("command"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 pub fn render(event_name: &str, outcome: &PolicyOutcome) -> Value {
@@ -125,6 +148,16 @@ mod tests {
         let payload = json!({
             "toolName": "bash",
             "input": { "command": "rm -rf /" }
+        });
+        let ev = parse("tool_call", &payload);
+        assert_eq!(ev.args.command.as_deref(), Some("rm -rf /"));
+    }
+
+    #[test]
+    fn then_run_object_command_wins() {
+        let payload = json!({
+            "toolName": "bash",
+            "input": { "then_run": { "command": "rm -rf /" } }
         });
         let ev = parse("tool_call", &payload);
         assert_eq!(ev.args.command.as_deref(), Some("rm -rf /"));

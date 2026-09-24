@@ -60,6 +60,7 @@ fn run_case(harness: Harness, event: &str, stem: &str, home: &PathBuf, cwd: Opti
         paths: HookPaths::from_home(home),
         policy_override: None,
         telemetry_enabled: false,
+        record_dir: None,
     };
     let mut out = Vec::new();
     hook_stdio_with(
@@ -181,6 +182,13 @@ fn muse_matrix() {
     run_case(Harness::Muse, "PreToolUse", "small_read", &home, None);
     run_case(Harness::Muse, "PreToolUse", "shell_deny", &home, None);
     run_case(Harness::Muse, "PreToolUse", "unknown_payload", &home, None);
+    run_case(
+        Harness::Muse,
+        "PostToolUse",
+        "big_shell_output",
+        &home,
+        None,
+    );
 }
 
 #[test]

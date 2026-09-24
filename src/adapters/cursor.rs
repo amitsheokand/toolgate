@@ -33,7 +33,7 @@ pub fn parse(event_name: &str, value: &Value) -> ToolEvent {
     };
     let hook_event = value.get("hook_event_name").and_then(Value::as_str);
     let tool_name = value.get("tool_name").and_then(Value::as_str).unwrap_or("");
-    let classify = hook_event.unwrap_or(tool_name);
+    let classify = classify_name(hook_event, tool_name);
     let tool = map_tool_name(classify, value);
     let cwd = value
         .get("cwd")
@@ -84,7 +84,38 @@ fn post_output(event_name: &str, value: &Value) -> Option<String> {
     }
 }
 
+/// Cursor always sends `hook_event_name` alongside `tool_name`; only dedicated
+/// after/before MCP/shell hooks use the event name for classification.
+fn classify_name<'a>(hook_event: Option<&'a str>, tool_name: &'a str) -> &'a str {
+    match hook_event {
+        Some("beforeMCPExecution" | "afterMCPExecution" | "afterShellExecution") => {
+            hook_event.unwrap()
+        }
+        _ => tool_name,
+    }
+}
+
+fn mcp_kind(value: &Value, tool: &str) -> ToolKind {
+    let server = value
+        .get("mcp_server_name")
+        .and_then(Value::as_str)
+        .unwrap_or("mcp")
+        .to_owned();
+    ToolKind::Mcp {
+        server,
+        tool: tool.to_owned(),
+    }
+}
+
 fn map_tool_name(name: &str, value: &Value) -> ToolKind {
+    if value.get("mcp_server_name").is_some()
+        && !matches!(
+            name,
+            "beforeMCPExecution" | "afterMCPExecution" | "afterShellExecution"
+        )
+    {
+        return mcp_kind(value, name);
+    }
     match name {
         "Read" | "beforeReadFile" => ToolKind::Read,
         "Write" | "afterFileEdit" => ToolKind::Write,
@@ -93,16 +124,9 @@ fn map_tool_name(name: &str, value: &Value) -> ToolKind {
         "Grep" => ToolKind::Grep,
         "Glob" => ToolKind::Glob,
         other if other.starts_with("MCP:") => {
-            let tool = other.strip_prefix("MCP:").unwrap_or(other);
-            let server = value
-                .get("mcp_server_name")
-                .and_then(Value::as_str)
-                .unwrap_or("mcp")
-                .to_owned();
-            ToolKind::Mcp {
-                server,
-                tool: tool.to_owned(),
-            }
+            let rest = other.strip_prefix("MCP:").unwrap_or(other);
+            let (_server, tool) = rest.split_once(':').unwrap_or(("mcp", rest));
+            mcp_kind(value, tool)
         }
         "beforeMCPExecution" | "afterMCPExecution" => {
             let tool = value
@@ -110,12 +134,7 @@ fn map_tool_name(name: &str, value: &Value) -> ToolKind {
                 .and_then(Value::as_str)
                 .unwrap_or("tool")
                 .to_owned();
-            let server = value
-                .get("mcp_server_name")
-                .and_then(Value::as_str)
-                .unwrap_or("mcp")
-                .to_owned();
-            ToolKind::Mcp { server, tool }
+            mcp_kind(value, &tool)
         }
         _ => ToolKind::Other(name.to_owned()),
     }
@@ -243,5 +262,36 @@ mod tests {
         });
         let ev = parse("preToolUse", &payload);
         assert_eq!(ev.tool, ToolKind::Shell);
+    }
+
+    #[test]
+    fn pre_tool_use_ignores_hook_event_name_for_classification() {
+        let payload = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": { "command": "rm -rf /tmp/x" },
+            "cwd": "/tmp"
+        });
+        let ev = parse("preToolUse", &payload);
+        assert_eq!(ev.tool, ToolKind::Shell);
+    }
+
+    #[test]
+    fn post_mcp_uses_tool_name_when_server_present() {
+        let payload = json!({
+            "hook_event_name": "postToolUse",
+            "tool_name": "search",
+            "mcp_server_name": "one-grep",
+            "tool_output": "x".repeat(5000),
+            "cwd": "/tmp"
+        });
+        let ev = parse("postToolUse", &payload);
+        assert!(matches!(
+            ev.tool,
+            ToolKind::Mcp {
+                server,
+                tool
+            } if server == "one-grep" && tool == "search"
+        ));
     }
 }
