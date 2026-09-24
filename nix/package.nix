@@ -12,14 +12,15 @@ rustPlatform.buildRustPackage {
   version = "0.1.0";
 
   src = lib.cleanSourceWith {
-    src = ../.;
+    src = lib.cleanSource ../.;
     filter =
       path: _type:
       let
         name = baseNameOf path;
       in
       name != "target"
-      && name != ".git"
+      && name != "result"
+      && !(lib.hasPrefix "result-" name)
       && name != ".DS_Store"
       && !(lib.hasSuffix ".md" name && lib.hasPrefix "RECEIPT-" name)
       && !(lib.hasSuffix ".md" name && lib.hasPrefix "PACKET" name);
@@ -33,8 +34,14 @@ rustPlatform.buildRustPackage {
     rustPlatform.bindgenHook
   ];
 
-  # Package check deferred; use `cargo test` / host validation instead.
-  doCheck = false;
+  doCheck = true;
+
+  # Nix check sandbox has no network (loopback HTTP for mock TypeSafe API).
+  cargoTestFlags = [
+    "--"
+    "--skip"
+    "judge_round_trips_systemone_wire"
+  ];
 
   meta = with lib; {
     description = "Harness-side guardrails: capped file reads and related gates";

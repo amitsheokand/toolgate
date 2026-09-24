@@ -59,14 +59,13 @@
       checks = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ self.overlays.default ];
+          };
         in
         {
-          package-file = pkgs.runCommand "toolgate-package-file" { } ''
-            test -f ${./nix/package.nix}
-            test -f ${./Cargo.lock}
-            printf 'ok\n' > "$out"
-          '';
+          toolgate = pkgs.toolgate;
         }
       );
 
