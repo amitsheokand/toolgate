@@ -727,23 +727,27 @@ fn schema_allows(argv: &[String], root: &str) -> bool {
     }
 }
 
+fn program_has_allow_schema(prog: &str) -> bool {
+    matches!(prog, "cargo" | "git" | "rg" | "ls")
+}
+
 fn hard_allow(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
+    if schema_allows(argv, root) {
+        return Some(Verdict::Allow);
+    }
+    if argv.len() != 1 {
+        return None;
+    }
+    let prog = program_basename(&argv[0]);
+    if program_has_allow_schema(prog) {
+        return None;
+    }
     for prefix in &rules.allow {
-        if argv_prefix_match(argv, prefix) {
-            if schema_allows(argv, root) {
-                return Some(Verdict::Allow);
-            }
-            if argv.len() == prefix.len() {
-                return Some(Verdict::Allow);
-            }
-            return None;
+        if prefix.len() == 1 && argv_prefix_match(argv, prefix) {
+            return Some(Verdict::Allow);
         }
     }
-    if schema_allows(argv, root) {
-        Some(Verdict::Allow)
-    } else {
-        None
-    }
+    None
 }
 
 /// Deterministic verdict from [`Rules`], or `None` when Jev should judge.
@@ -1331,13 +1335,56 @@ mod tests {
     }
 
     #[test]
-    fn inside_root_rejects_symlink_escape() {
+    fn rules_allow_prefix_never_bypasses_schema() {
+        let rules = Rules {
+            allow: vec![
+                vec![
+                    "cargo".into(),
+                    "build".into(),
+                    "--config".into(),
+                    "build.rustc=/bin/sh".into(),
+                ],
+                vec!["git".into(), "diff".into(), "--textconv".into()],
+            ],
+            deny: vec![],
+        };
+        let root = test_root();
+        for argv in [
+            vec![
+                "cargo".into(),
+                "build".into(),
+                "--config".into(),
+                "build.rustc=/bin/sh".into(),
+            ],
+            vec!["git".into(), "diff".into(), "--textconv".into()],
+        ] {
+            assert!(rules_verdict(&argv, &rules, root).is_none(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_paths_through_symlink_dotdot_not_allowed() {
         let root_dir = tempfile::tempdir().expect("tempdir");
-        let root = root_dir.path();
+        let root = root_dir.path().to_str().expect("utf8 root");
         let outside = tempfile::tempdir().expect("outside");
-        let link = root.join("link");
-        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
-        assert!(crate::read::inside_root(root, "link/nested").is_none());
+        std::os::unix::fs::symlink(outside.path(), root_dir.path().join("link")).expect("symlink");
+        let rules = Rules::default();
+        for argv in [
+            vec![
+                "cargo".into(),
+                "build".into(),
+                "--target-dir".into(),
+                "link/../out".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "test".into(),
+                "--manifest-path".into(),
+                "link/../out/Cargo.toml".into(),
+            ],
+        ] {
+            assert!(rules_verdict(&argv, &rules, root).is_none(), "{argv:?}");
+        }
     }
 
     #[test]

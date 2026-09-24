@@ -57,56 +57,70 @@ pub struct ReadHit {
     pub text: Vec<String>,
 }
 
-/// Lexically resolve `value` against `root`; `None` if `..` escapes `root`.
-fn lexical_under_root(root: &Path, value: &str) -> Option<PathBuf> {
-    let joined = if Path::new(value).is_absolute() {
-        PathBuf::from(value)
-    } else {
-        root.join(value)
-    };
-    let mut normal = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normal.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normal.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normal.pop();
-            }
-            std::path::Component::Normal(part) => normal.push(part),
-        }
-    }
-    if normal.starts_with(root) {
-        Some(normal)
-    } else {
-        None
-    }
+fn path_under_canonical_root(path: &Path, canon_root: &Path) -> bool {
+    path.starts_with(canon_root)
 }
 
-fn under_canonical_root(lex: &Path, canon_root: &Path) -> bool {
-    let mut probe = lex.to_path_buf();
-    loop {
-        if probe.exists() {
-            return probe
-                .canonicalize()
-                .map(|c| c.starts_with(canon_root))
-                .unwrap_or(false);
-        }
-        if !probe.pop() {
-            return lex.starts_with(canon_root);
-        }
-    }
-}
-
-/// Join `value` to `root`, reject lexical `..` escapes, then require the
-/// longest existing ancestor (symlinks resolved) stays under canonical `root`.
+/// Join `value` to `root`, walking one component at a time: canonicalize each
+/// existing prefix (symlinks resolved) before the next step; `..` applies to
+/// the resolved directory. Non-existent suffixes are lexical only (no `..`).
 #[must_use]
 pub fn inside_root(root: impl AsRef<Path>, value: &str) -> Option<PathBuf> {
     let root = root.as_ref();
-    let lex = lexical_under_root(root, value)?;
     let canon_root = root.canonicalize().ok()?;
-    if under_canonical_root(&lex, &canon_root) {
-        Some(lex)
+    let value_path = Path::new(value);
+
+    let components: Vec<std::path::Component<'_>> = if value_path.is_absolute() {
+        if !value_path.starts_with(root) {
+            return None;
+        }
+        value_path.strip_prefix(root).ok()?.components().collect()
+    } else {
+        value_path.components().collect()
+    };
+
+    let mut current = canon_root.clone();
+    let mut lexical_tail = false;
+
+    for component in components {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {}
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if lexical_tail {
+                    return None;
+                }
+                if !current.pop() {
+                    return None;
+                }
+                if !path_under_canonical_root(&current, &canon_root) {
+                    return None;
+                }
+                if current.exists() {
+                    current = current.canonicalize().ok()?;
+                    if !path_under_canonical_root(&current, &canon_root) {
+                        return None;
+                    }
+                    lexical_tail = false;
+                }
+            }
+            std::path::Component::Normal(part) => {
+                current.push(part);
+                if current.exists() {
+                    current = current.canonicalize().ok()?;
+                    if !path_under_canonical_root(&current, &canon_root) {
+                        return None;
+                    }
+                    lexical_tail = false;
+                } else {
+                    lexical_tail = true;
+                }
+            }
+        }
+    }
+
+    if path_under_canonical_root(&current, &canon_root) {
+        Some(current)
     } else {
         None
     }
@@ -305,6 +319,18 @@ mod tests {
         assert!(inside_root(dir.path(), "../escape").is_none());
         assert!(inside_root(dir.path(), "sub/../../outside").is_none());
         assert!(inside_root(dir.path(), "a.txt").is_some());
+    }
+
+    #[test]
+    fn inside_root_rejects_symlink_component_walk() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let root = root_dir.path();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(root.join("a")).expect("mkdir a");
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).expect("symlink");
+        for value in ["link/nested", "link/../out", "link/../../x", "a/../link/x"] {
+            assert!(inside_root(root, value).is_none(), "{value}");
+        }
     }
 
     #[test]

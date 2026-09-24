@@ -82,16 +82,23 @@ toolgate v0.1.0
 | 3 | Git `-c` / `--config` / `--config-env` / `--exec-path` on allow path | Dropped from globals; `-c` routes unknown; cargo `--config`/`-Z`/`--pre`/`program` flags fail closed |
 | 4 | `Rules.allow` for `ls` etc. bypassed schema | Every allow match requires `schema_allows` or bare program-only prefix (`argv.len() == prefix.len()`) |
 
+## Review round 6 (Grok NO-GO)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | `lexical_under_root` applied `..` before symlink resolution; `link/../out` looked like `<root>/out` | `inside_root` walks components from canonical root, canonicalizing each existing prefix; non-existent tail is lexical without `..`; tests for `link/../out`, `link/../../x`, `a/../link/x` |
+| 2 | `Rules.allow` exact-prefix match returned Allow when `schema_allows` was false | Allow only from `schema_allows`; programs without schema allow only `argv == [program]` via single-token `rules.allow`; tests for `cargo build --config …` and `git diff --textconv` prefixes |
+
 ## Gate output (tail)
 
 ```
-running 51 tests
-...................................................
-test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+running 53 tests
+.....................................................
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
 
-running 44 tests
-............................................
-test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+running 46 tests
+..............................................
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
 ```
 
 (`cargo fmt --check` clean.)
