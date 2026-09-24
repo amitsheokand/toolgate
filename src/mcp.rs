@@ -86,7 +86,7 @@ struct ReadParams {
 struct ToolGateState {
     gate_mode: gate::GateMode,
     rules: gate::Rules,
-    verdict_cache: Mutex<HashMap<Vec<String>, gate::Verdict>>,
+    verdict_cache: Mutex<HashMap<gate::GateCacheKey, gate::Verdict>>,
     #[cfg(feature = "jev")]
     jev: Mutex<Option<Arc<gate::Gate>>>,
 }
@@ -143,9 +143,13 @@ impl ToolGate {
         if let Some(v) = gate::rules_verdict(&argv, &self.state.rules) {
             return Self::verdict_to_mcp(v);
         }
+        let cache_key = gate::GateCacheKey {
+            root: root.to_owned(),
+            argv: argv.clone(),
+        };
         {
             let cache = self.state.verdict_cache.lock().expect("cache lock");
-            if let Some(v) = cache.get(&argv) {
+            if let Some(v) = cache.get(&cache_key) {
                 return Self::verdict_to_mcp(v.clone());
             }
         }
@@ -165,7 +169,7 @@ impl ToolGate {
         let verdict = gate::decide(score, &gate::Policy::default());
         {
             let mut cache = self.state.verdict_cache.lock().expect("cache lock");
-            cache.insert(argv, verdict.clone());
+            cache.insert(cache_key, verdict.clone());
         }
         Self::verdict_to_mcp(verdict)
     }

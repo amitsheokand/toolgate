@@ -27,3 +27,24 @@ test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 ```
 
 (`cargo fmt --check` clean.)
+
+## Review round 1 (Grok NO-GO on f5ec3a4)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | `char_boundary_at_or_before` dropped last in-budget byte | Return `bytes.len()` when `pos >= len`; walk back only over UTF-8 continuation bytes; tests for ASCII identity and multibyte tail |
+| 2 | Tail decoded with `from_utf8_lossy` mid-char; elided ignored boundary trim | Snap tail start/end to char boundaries; `elided = total - head_kept - tail_kept`; multibyte straddle test |
+| 3 | Normal exit joined readers without killing the group | `kill_process_group_pgid` before reader joins on success and timeout; ignore `ESRCH`; test `bash -c 'sleep … & echo hi'` |
+| 4 | Allow/deny was literal argv prefix match | Basename program; rm `-rf`/`-fr`/long flags; allowlist guards for cargo/git/rg; shells/find/env → Jev; bypass tests |
+| 5 | Verdict cache keyed by argv only | `GateCacheKey { root, argv }` in `enforce` and MCP cache |
+| 6 | `tokio` always required | `tokio` optional; enabled only by `server` and `jev` features |
+
+### `cargo tree --no-default-features -e normal` (top level)
+
+```
+toolgate v0.1.0
+├── libc v0.2.189
+├── serde v1.0.229
+├── serde_json v1.0.151
+└── thiserror v2.0.21
+```

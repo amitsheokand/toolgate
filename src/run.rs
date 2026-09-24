@@ -139,37 +139,39 @@ impl StreamClipper {
             return String::new();
         }
         if self.total <= self.head_cap {
-            return utf8_char_prefix(&self.head, self.head.len());
+            return bytes_to_str(&self.head);
         }
         let tail_bytes = self.tail.ordered();
         if self.total <= self.head_cap + self.tail_cap {
             let mut combined = self.head.clone();
             combined.extend_from_slice(&tail_bytes);
-            return utf8_char_prefix(&combined, combined.len());
+            return bytes_to_str(&combined);
         }
-        let head_s = utf8_char_prefix(&self.head, self.head_cap);
-        let tail_s = utf8_char_suffix(&tail_bytes, self.tail_cap);
-        let elided = self.total - self.head_cap - self.tail_cap;
+        let head_end = char_boundary_at_or_before(&self.head, self.head_cap);
+        let head_kept = head_end;
+        let tail_start =
+            char_boundary_at_or_after(&tail_bytes, tail_bytes.len().saturating_sub(self.tail_cap));
+        let tail_end = char_boundary_at_or_before(&tail_bytes, tail_bytes.len());
+        let tail_kept = tail_end.saturating_sub(tail_start);
+        let elided = self.total - head_kept - tail_kept;
+        let head_s = bytes_to_str(&self.head[..head_end]);
+        let tail_s = bytes_to_str(&tail_bytes[tail_start..tail_end]);
         format!("{head_s}... [{elided} bytes elided] ...{tail_s}")
     }
 }
 
-fn utf8_char_prefix(bytes: &[u8], max_bytes: usize) -> String {
-    let end = char_boundary_at_or_before(bytes, max_bytes.min(bytes.len()));
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
-}
-
-fn utf8_char_suffix(bytes: &[u8], max_bytes: usize) -> String {
-    if bytes.len() <= max_bytes {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let start = char_boundary_at_or_after(bytes, bytes.len() - max_bytes);
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
+fn bytes_to_str(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn char_boundary_at_or_before(bytes: &[u8], pos: usize) -> usize {
-    let mut end = pos.min(bytes.len());
-    while end > 0 && (end == bytes.len() || is_utf8_continuation(bytes[end])) {
+    if pos >= bytes.len() {
+        return bytes.len();
+    }
+    let mut end = pos;
+    while end > 0 && is_utf8_continuation(bytes[end]) {
         end -= 1;
     }
     end
@@ -233,11 +235,22 @@ fn spawn_command(
 }
 
 #[cfg(unix)]
+fn kill_process_group_pgid(pgid: i32) {
+    unsafe {
+        let rc = libc::killpg(pgid, libc::SIGKILL);
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                let _ = err;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn kill_process_group(child: &mut std::process::Child) {
     let pid = child.id() as i32;
-    unsafe {
-        let _ = libc::killpg(pid, libc::SIGKILL);
-    }
+    kill_process_group_pgid(pid);
     let _ = child.kill();
 }
 
@@ -246,16 +259,25 @@ fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+fn join_readers(
+    child: &mut std::process::Child,
+    out_reader: std::thread::JoinHandle<String>,
+    err_reader: std::thread::JoinHandle<String>,
+) -> (String, String) {
+    kill_process_group(child);
+    let _ = child.wait();
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    (stdout, stderr)
+}
+
 fn finish_timeout(
     child: &mut std::process::Child,
     out_reader: std::thread::JoinHandle<String>,
     err_reader: std::thread::JoinHandle<String>,
     started: Instant,
 ) -> RunHit {
-    kill_process_group(child);
-    let _ = child.wait();
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
+    let (stdout, stderr) = join_readers(child, out_reader, err_reader);
     RunHit {
         code: -1,
         stdout,
@@ -294,6 +316,8 @@ pub fn run(
     let (head_cap, tail_cap) = head_tail_caps(output_cap);
     let started = Instant::now();
     let mut child = spawn_command(root, program, args)?;
+    #[cfg(unix)]
+    let pgid = child.id() as i32;
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
     let out_reader = std::thread::spawn(move || {
@@ -314,6 +338,10 @@ pub fn run(
     loop {
         match child.try_wait()? {
             Some(status) => {
+                #[cfg(unix)]
+                kill_process_group_pgid(pgid);
+                #[cfg(not(unix))]
+                kill_process_group(&mut child);
                 let stdout = out_reader.join().unwrap_or_default();
                 let stderr = err_reader.join().unwrap_or_default();
                 return Ok(RunHit {
@@ -350,7 +378,68 @@ mod tests {
         let hit = run(dir.path(), "echo", &["hi".to_owned()], 10, OUTPUT_CAP_BYTES).expect("run");
         assert_eq!(hit.code, 0);
         assert!(!hit.timed_out);
-        assert!(hit.stdout.contains("hi"));
+        assert_eq!(hit.stdout.trim_end(), "hi");
+    }
+
+    #[test]
+    fn small_ascii_output_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hit = run(
+            dir.path(),
+            "printf",
+            &["%s".to_owned(), "hello-world".to_owned()],
+            10,
+            OUTPUT_CAP_BYTES,
+        )
+        .expect("run");
+        assert_eq!(hit.stdout, "hello-world");
+    }
+
+    #[test]
+    fn in_budget_multibyte_tail_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hit = run(
+            dir.path(),
+            "printf",
+            &["%s".to_owned(), "abcα".to_owned()],
+            10,
+            OUTPUT_CAP_BYTES,
+        )
+        .expect("run");
+        assert_eq!(hit.stdout, "abcα");
+        assert!(!hit.stdout.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn multibyte_straddling_head_tail_cuts() {
+        let mut c = StreamClipper::new(4, 4);
+        c.push("αβ".as_bytes());
+        c.push("γδεζη".as_bytes());
+        let s = c.finish();
+        assert!(!s.contains('\u{FFFD}'));
+        assert!(s.contains("bytes elided"));
+    }
+
+    #[test]
+    fn bash_background_sleep_does_not_block_join() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = "toolgate_pgrep_marker_884422";
+        let script = format!("sleep 99999 {marker} & echo hi");
+        let started = Instant::now();
+        let hit = run(
+            dir.path(),
+            "bash",
+            &["-c".to_owned(), script],
+            10,
+            OUTPUT_CAP_BYTES,
+        )
+        .expect("run");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(hit.stdout.trim(), "hi");
+        std::thread::sleep(Duration::from_millis(300));
+        let probe = Command::new("pgrep").args(["-f", marker]).output();
+        let alive = probe.map(|o| !o.stdout.is_empty()).unwrap_or(false);
+        assert!(!alive, "background sleep still alive");
     }
 
     #[test]

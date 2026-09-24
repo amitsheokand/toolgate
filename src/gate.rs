@@ -4,6 +4,10 @@
 //! logs), [`decide`] is a pure function testable with canned numbers, and
 //! failures fail **closed**. The ask band refuses with a "needs a person"
 //! message (no human channel in this tool).
+//!
+//! **Residual:** allowed `git diff` / `git log` skip Jev but cannot
+//! neutralize repo `diff.external`, aliases, or other config — treat logs as
+//! ground truth.
 
 #[cfg(feature = "jev")]
 use std::collections::HashMap;
@@ -66,7 +70,8 @@ impl GateMode {
     }
 }
 
-/// argv prefix lists: allow runs without Jev; deny refuses without Jev.
+/// argv prefix lists (documentation / custom rules); [`rules_verdict`] uses
+/// structured matching on program basename and flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rules {
     /// Prefixes that always run (no Jev call).
@@ -99,30 +104,153 @@ impl Default for Rules {
     }
 }
 
-fn argv_prefix_match(argv: &[String], prefix: &[String]) -> bool {
-    if argv.len() < prefix.len() {
-        return false;
+fn program_basename(program: &str) -> &str {
+    program.rsplit(['/', '\\']).next().unwrap_or(program)
+}
+
+fn subcommand(args: &[String]) -> Option<&str> {
+    args.first().map(String::as_str)
+}
+
+fn arg_is(value: &str, name: &str) -> bool {
+    value == name || value.starts_with(&format!("{name}="))
+}
+
+fn has_long_or_short(args: &[String], long: &str, short: char) -> bool {
+    args.iter().any(|a| {
+        arg_is(a, long)
+            || (a.starts_with('-') && !a.starts_with("--") && a[1..].chars().any(|c| c == short))
+    })
+}
+
+fn expand_short_flags(args: &[String]) -> Vec<char> {
+    let mut flags = Vec::new();
+    for a in args {
+        if a.starts_with("--") || a == "-" {
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix('-') {
+            for c in rest.chars() {
+                if c.is_ascii_alphabetic() {
+                    flags.push(c);
+                }
+            }
+        }
     }
-    argv.iter().zip(prefix.iter()).all(|(a, b)| a == b)
+    flags
+}
+
+fn has_rm_recursive_force(args: &[String]) -> bool {
+    let flags = expand_short_flags(args);
+    let short_r = flags.iter().any(|&c| c == 'r' || c == 'R');
+    let short_f = flags.iter().any(|&c| c == 'f');
+    let long_r = args.iter().any(|a| arg_is(a, "--recursive"));
+    let long_f = args.iter().any(|a| arg_is(a, "--force"));
+    (short_r || long_r) && (short_f || long_f)
+}
+
+fn has_git_config_injection(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        arg_is(a, "-c")
+            || a.starts_with("-c")
+            || arg_is(a, "--config")
+            || arg_is(a, "--config-env")
+            || arg_is(a, "--exec-path")
+    })
+}
+
+fn risky_cargo_args(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| arg_is(a, "--config") || a.starts_with("-Z") || a.contains("runner"))
+}
+
+fn risky_rg_args(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| arg_is(a, "--pre") || arg_is(a, "--pre-glob"))
+}
+
+fn find_risky(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        arg_is(a, "-exec")
+            || arg_is(a, "-execdir")
+            || arg_is(a, "-delete")
+            || a.starts_with("-exec=")
+            || a.starts_with("-execdir=")
+    })
+}
+
+fn deny_verdict(argv: &[String]) -> Option<Verdict> {
+    if argv.is_empty() {
+        return None;
+    }
+    let prog = program_basename(&argv[0]);
+    let args = &argv[1..];
+    if prog == "rm" && has_rm_recursive_force(args) {
+        return Some(Verdict::Block("denylist: rm recursive+force".into()));
+    }
+    if prog == "git" {
+        if subcommand(args) == Some("push") && has_long_or_short(args, "--force", 'f') {
+            return Some(Verdict::Block("denylist: git push --force".into()));
+        }
+        if subcommand(args) == Some("reset") && args.iter().any(|a| arg_is(a, "--hard")) {
+            return Some(Verdict::Block("denylist: git reset --hard".into()));
+        }
+    }
+    if prog == "dd" || prog == "mkfs" {
+        return Some(Verdict::Block(format!("denylist: {prog}")));
+    }
+    None
+}
+
+fn allow_verdict(argv: &[String]) -> Option<Verdict> {
+    if argv.is_empty() {
+        return None;
+    }
+    let prog = program_basename(&argv[0]);
+    let args = &argv[1..];
+    match prog {
+        "cargo" => {
+            let sub = subcommand(args)?;
+            if !matches!(sub, "test" | "check" | "build") {
+                return None;
+            }
+            if risky_cargo_args(&args[1..]) {
+                return None;
+            }
+            Some(Verdict::Allow)
+        }
+        "git" => {
+            let sub = subcommand(args)?;
+            if !matches!(sub, "status" | "diff" | "log") {
+                return None;
+            }
+            if has_git_config_injection(&args[1..]) {
+                return None;
+            }
+            Some(Verdict::Allow)
+        }
+        "rg" if !risky_rg_args(args) => Some(Verdict::Allow),
+        "ls" => Some(Verdict::Allow),
+        "env" | "bash" | "sh" | "zsh" | "xargs" => None,
+        "find" if find_risky(args) => None,
+        "find" => None,
+        _ => None,
+    }
 }
 
 /// Deterministic verdict from [`Rules`], or `None` when Jev should judge.
 #[must_use]
-pub fn rules_verdict(argv: &[String], rules: &Rules) -> Option<Verdict> {
-    for prefix in &rules.deny {
-        if argv_prefix_match(argv, prefix) {
-            return Some(Verdict::Block(format!(
-                "denylist prefix: {}",
-                prefix.join(" ")
-            )));
-        }
-    }
-    for prefix in &rules.allow {
-        if argv_prefix_match(argv, prefix) {
-            return Some(Verdict::Allow);
-        }
-    }
-    None
+pub fn rules_verdict(argv: &[String], _rules: &Rules) -> Option<Verdict> {
+    deny_verdict(argv).or_else(|| allow_verdict(argv))
+}
+
+/// Cache key for Jev verdicts (root + argv).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GateCacheKey {
+    /// Workspace root string passed to Jev.
+    pub root: String,
+    /// Full argv (program + args).
+    pub argv: Vec<String>,
 }
 
 /// Gate errors: key/config problems fail closed at the call site.
@@ -191,7 +319,7 @@ pub async fn enforce(
     mode: GateMode,
     gate: &Gate,
     rules: &Rules,
-    cache: &mut HashMap<Vec<String>, Verdict>,
+    cache: &mut HashMap<GateCacheKey, Verdict>,
     program: &str,
     args: &[String],
     root: &str,
@@ -206,12 +334,16 @@ pub async fn enforce(
     if let Some(v) = rules_verdict(&argv, rules) {
         return Ok(v);
     }
-    if let Some(v) = cache.get(&argv) {
+    let key = GateCacheKey {
+        root: root.to_owned(),
+        argv,
+    };
+    if let Some(v) = cache.get(&key) {
         return Ok(v.clone());
     }
-    let score = gate.judge(&argv, root).await?;
+    let score = gate.judge(&key.argv, root).await?;
     let verdict = decide(score, policy);
-    cache.insert(argv, verdict.clone());
+    cache.insert(key, verdict.clone());
     Ok(verdict)
 }
 
@@ -357,13 +489,63 @@ mod tests {
     }
 
     #[test]
-    fn rules_deny_rm_rf() {
+    fn rules_deny_rm_rf_variants() {
         let rules = Rules::default();
-        let argv = vec!["rm".into(), "-rf".into(), "/".into()];
-        assert!(matches!(
-            rules_verdict(&argv, &rules),
-            Some(Verdict::Block(_))
-        ));
+        for argv in [
+            vec!["rm".into(), "-rf".into(), "/".into()],
+            vec!["rm".into(), "-fr".into(), "/".into()],
+            vec!["rm".into(), "-r".into(), "-f".into()],
+            vec!["/bin/rm".into(), "--recursive".into(), "--force".into()],
+        ] {
+            assert!(
+                matches!(rules_verdict(&argv, &rules), Some(Verdict::Block(_))),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_bypasses_need_jev() {
+        let rules = Rules::default();
+        let cases: Vec<Vec<String>> = vec![
+            vec!["rg".into(), "--pre".into(), "sh".into(), "x".into()],
+            vec!["rg".into(), "--pre-glob".into(), "*.sh".into()],
+            vec![
+                "cargo".into(),
+                "test".into(),
+                "--config".into(),
+                "x.toml".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "test".into(),
+                "-p".into(),
+                "my-runner-crate".into(),
+            ],
+            vec!["git".into(), "diff".into(), "-c".into(), "x=y".into()],
+            vec!["git".into(), "log".into(), "--config".into(), "x=y".into()],
+            vec!["git".into(), "fetch".into()],
+            vec!["env".into(), "FOO=bar".into()],
+            vec!["bash".into(), "-c".into(), "echo".into()],
+            vec![
+                "find".into(),
+                ".".into(),
+                "-exec".into(),
+                "rm".into(),
+                "{}".into(),
+                ";".into(),
+            ],
+        ];
+        for argv in cases {
+            assert!(rules_verdict(&argv, &rules).is_none(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn git_status_without_config_still_allowed() {
+        let rules = Rules::default();
+        let argv = vec!["git".into(), "status".into()];
+        assert!(matches!(rules_verdict(&argv, &rules), Some(Verdict::Allow)));
     }
 
     #[test]
@@ -422,7 +604,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn enforce_caches_jev_verdict() {
+        async fn enforce_caches_by_root_and_argv() {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
@@ -455,26 +637,38 @@ mod tests {
                 &mut cache,
                 "curl",
                 &["http://x".into()],
-                "/tmp",
+                "/tmp/a",
                 &policy,
             )
             .await
             .expect("enforce");
             assert!(matches!(v1, Verdict::Allow));
-            let v2 = enforce(
+            let _v2 = enforce(
                 GateMode::Jev,
                 &gate,
                 &rules,
                 &mut cache,
                 "curl",
                 &["http://x".into()],
-                "/tmp",
+                "/tmp/b",
                 &policy,
             )
             .await
             .expect("enforce");
-            assert_eq!(v1, v2);
-            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let v3 = enforce(
+                GateMode::Jev,
+                &gate,
+                &rules,
+                &mut cache,
+                "curl",
+                &["http://x".into()],
+                "/tmp/a",
+                &policy,
+            )
+            .await
+            .expect("enforce");
+            assert_eq!(v1, v3);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
     }
 }
