@@ -14,8 +14,19 @@ toolgate read <file> [--line N] [--radius R] [--start M --end K] [--root <dir>]
 toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]  # prints its diff
 toolgate run <program> [args...] [--root <dir>] [--timeout S]          # argv-direct
 toolgate serve  # MCP stdio server (`read`, `edit`, `run`)
+```
 
 ## Install
+
+**Nix** (recommended on NixOS):
+
+```bash
+nix build .#toolgate
+./result/bin/toolgate --version
+nix develop   # cargo/clippy/rustfmt with link inputs from the package
+```
+
+**Cargo** (elsewhere):
 
 ```bash
 cargo install --git https://github.com/amitsheokand/toolgate
@@ -27,13 +38,12 @@ opencode (`~/.config/opencode/opencode.json`, preserves peers):
 ```json
 { "mcp": { "toolgate": {
   "type": "local",
-  "command": ["/home/amitsheokand/.local/bin/toolgate", "serve", "--stdio"],
+  "command": ["toolgate", "serve", "--stdio"],
   "enabled": true } } }
 ```
 
 Restart the harness after (re)builds: the running server keeps serving
 its loaded image.
-```
 
 - `--line N`: ~200-line window around N (default radius 100), clamped.
 - No `--line`: files ≤ 400 lines read whole; larger files require
