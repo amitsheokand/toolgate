@@ -57,12 +57,12 @@ pub struct ReadHit {
     pub text: Vec<String>,
 }
 
-/// Resolve `raw` against `root`, rejecting lexical escapes.
-fn resolve(root: &Path, raw: &str) -> Result<PathBuf, Error> {
-    let joined = if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
+/// Lexically resolve `value` against `root`; `None` if `..` escapes `root`.
+fn lexical_under_root(root: &Path, value: &str) -> Option<PathBuf> {
+    let joined = if Path::new(value).is_absolute() {
+        PathBuf::from(value)
     } else {
-        root.join(raw)
+        root.join(value)
     };
     let mut normal = PathBuf::new();
     for component in joined.components() {
@@ -77,10 +77,44 @@ fn resolve(root: &Path, raw: &str) -> Result<PathBuf, Error> {
         }
     }
     if normal.starts_with(root) {
-        Ok(normal)
+        Some(normal)
     } else {
-        Err(Error::Escape(raw.to_owned()))
+        None
     }
+}
+
+fn under_canonical_root(lex: &Path, canon_root: &Path) -> bool {
+    let mut probe = lex.to_path_buf();
+    loop {
+        if probe.exists() {
+            return probe
+                .canonicalize()
+                .map(|c| c.starts_with(canon_root))
+                .unwrap_or(false);
+        }
+        if !probe.pop() {
+            return lex.starts_with(canon_root);
+        }
+    }
+}
+
+/// Join `value` to `root`, reject lexical `..` escapes, then require the
+/// longest existing ancestor (symlinks resolved) stays under canonical `root`.
+#[must_use]
+pub fn inside_root(root: impl AsRef<Path>, value: &str) -> Option<PathBuf> {
+    let root = root.as_ref();
+    let lex = lexical_under_root(root, value)?;
+    let canon_root = root.canonicalize().ok()?;
+    if under_canonical_root(&lex, &canon_root) {
+        Some(lex)
+    } else {
+        None
+    }
+}
+
+/// Resolve `raw` against `root`, rejecting escapes.
+fn resolve(root: &Path, raw: &str) -> Result<PathBuf, Error> {
+    inside_root(root, raw).ok_or_else(|| Error::Escape(raw.to_owned()))
 }
 
 /// Read `lines` (1-based, inclusive) from already-loaded text.
@@ -263,6 +297,14 @@ mod tests {
         .expect("read");
         assert_eq!((hit.start, hit.end), (10, 20));
         assert_eq!(hit.text.len(), 11);
+    }
+
+    #[test]
+    fn inside_root_rejects_lexical_escape() {
+        let dir = workspace_with(&[("a.txt", "hi\n")]);
+        assert!(inside_root(dir.path(), "../escape").is_none());
+        assert!(inside_root(dir.path(), "sub/../../outside").is_none());
+        assert!(inside_root(dir.path(), "a.txt").is_some());
     }
 
     #[test]

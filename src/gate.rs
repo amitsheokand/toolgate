@@ -137,34 +137,16 @@ const GIT_GLOBAL_FLAGS: &[FlagDef] = &[
         long: "git-dir",
         short: None,
         arity: FlagArity::EqOrValue,
-        path_value: false,
+        path_value: true,
     },
     FlagDef {
         long: "work-tree",
         short: None,
         arity: FlagArity::EqOrValue,
-        path_value: false,
+        path_value: true,
     },
     FlagDef {
         long: "namespace",
-        short: None,
-        arity: FlagArity::EqOrValue,
-        path_value: false,
-    },
-    FlagDef {
-        long: "exec-path",
-        short: None,
-        arity: FlagArity::EqOrValue,
-        path_value: false,
-    },
-    FlagDef {
-        long: "config-env",
-        short: None,
-        arity: FlagArity::EqOrValue,
-        path_value: false,
-    },
-    FlagDef {
-        long: "config",
         short: None,
         arity: FlagArity::EqOrValue,
         path_value: false,
@@ -202,11 +184,16 @@ const GIT_GLOBAL_FLAGS: &[FlagDef] = &[
 ];
 
 fn git_short_cluster_known(rest: &str) -> bool {
-    !rest.is_empty() && rest.chars().all(|c| matches!(c, 'C' | 'c' | 'P' | 'p'))
+    !rest.is_empty() && rest.chars().all(|c| matches!(c, 'C' | 'P' | 'p'))
 }
 
-/// One argv per step (two when `-C`/`-c` in a short cluster needs a value).
-fn advance_git_global(args: &[String], i: &mut usize) -> bool {
+fn git_global_path_ok(root: &str, value: &str) -> bool {
+    crate::read::inside_root(root, value).is_some()
+}
+
+/// One argv per step (two when `-C` in a short cluster needs a value).
+/// When `root` is `None` (deny normalization), path-valued globals are not checked.
+fn advance_git_global(args: &[String], i: &mut usize, root: Option<&str>) -> bool {
     if *i >= args.len() {
         return false;
     }
@@ -215,31 +202,51 @@ fn advance_git_global(args: &[String], i: &mut usize) -> bool {
         *i += 1;
         return true;
     }
-    if a == "-C" || a == "-c" {
+    if a == "-c" || (a.starts_with("-c") && !a.starts_with("-C")) {
+        *i += 1;
+        if a == "-c" && *i < args.len() {
+            *i += 1;
+        }
+        return true;
+    }
+    if a == "-C" {
         *i += 1;
         if *i < args.len() {
+            let v = args[*i].as_str();
             *i += 1;
+            if root.is_some_and(|r| !git_global_path_ok(r, v)) {
+                return true;
+            }
         }
         return false;
     }
     if a.starts_with("-C") && a.len() > 2 {
+        let v = &a[2..];
         *i += 1;
-        return false;
-    }
-    if a.starts_with("-c") && a.len() > 2 && a != "-c" {
-        *i += 1;
-        return false;
+        return root.is_some_and(|r| !git_global_path_ok(r, v));
     }
     if let Some(name) = long_flag_name(a) {
         if GIT_GLOBAL_FLAGS.iter().any(|f| f.long == name) {
-            let takes = GIT_GLOBAL_FLAGS
-                .iter()
-                .find(|f| f.long == name)
-                .map(|f| f.arity != FlagArity::Flag)
-                .unwrap_or(false);
+            let def = GIT_GLOBAL_FLAGS.iter().find(|f| f.long == name);
+            let takes = def.map(|f| f.arity != FlagArity::Flag).unwrap_or(false);
+            let path_value = def.map(|f| f.path_value).unwrap_or(false);
+            let inline = a.split_once('=').map(|(_, v)| v);
             *i += 1;
-            if takes && !a.contains('=') && *i < args.len() {
+            let value = if let Some(v) = inline {
+                Some(v)
+            } else if takes && *i < args.len() {
+                let v = args[*i].as_str();
                 *i += 1;
+                Some(v)
+            } else {
+                None
+            };
+            if path_value {
+                if let Some(v) = value {
+                    if root.is_some_and(|r| !git_global_path_ok(r, v)) {
+                        return true;
+                    }
+                }
             }
             return false;
         }
@@ -253,10 +260,17 @@ fn advance_git_global(args: &[String], i: &mut usize) -> bool {
             return true;
         }
         if git_short_cluster_known(rest) {
-            let needs_val = rest.contains('C') || rest.contains('c');
+            let needs_val = rest.contains('C');
             *i += 1;
-            if needs_val && *i < args.len() {
+            if needs_val {
+                if *i >= args.len() {
+                    return true;
+                }
+                let v = args[*i].as_str();
                 *i += 1;
+                if root.is_some_and(|r| !git_global_path_ok(r, v)) {
+                    return true;
+                }
             }
             return false;
         }
@@ -281,7 +295,7 @@ fn normalized_argv(argv: &[String]) -> Vec<String> {
             break;
         }
         let before = i;
-        if advance_git_global(args, &mut i) {
+        if advance_git_global(args, &mut i, None) {
             break;
         }
         if i == before {
@@ -421,20 +435,7 @@ fn hard_deny(argv: &[String], rules: &Rules) -> Option<Verdict> {
 }
 
 fn path_value_inside_root(root: &str, value: &str) -> bool {
-    let path = std::path::Path::new(value);
-    if path.is_absolute() {
-        let root_path = std::path::Path::new(root);
-        if let (Ok(r), Ok(p)) = (root_path.canonicalize(), path.canonicalize()) {
-            return p.starts_with(r);
-        }
-        let root_slash = if root.ends_with('/') {
-            root.to_owned()
-        } else {
-            format!("{root}/")
-        };
-        return value == root || value.starts_with(&root_slash);
-    }
-    true
+    crate::read::inside_root(root, value).is_some()
 }
 
 fn advance_one_flag(args: &[String], i: &mut usize, defs: &[FlagDef], root: &str) -> Option<bool> {
@@ -443,10 +444,7 @@ fn advance_one_flag(args: &[String], i: &mut usize, defs: &[FlagDef], root: &str
     }
     let a = &args[*i];
     if let Some(name) = long_flag_name(a) {
-        if matches!(
-            name,
-            "output" | "textconv" | "ext-diff" | "config" | "config-env"
-        ) {
+        if matches!(name, "output" | "textconv" | "ext-diff" | "config") {
             return Some(false);
         }
         let def = defs.iter().find(|d| d.long == name)?;
@@ -628,7 +626,7 @@ fn parse_git_allow(args: &[String], root: &str) -> bool {
             break;
         }
         let before = i;
-        if advance_git_global(args, &mut i) {
+        if advance_git_global(args, &mut i, Some(root)) {
             return false;
         }
         if i == before {
@@ -684,9 +682,13 @@ fn schema_allows(argv: &[String], root: &str) -> bool {
                     return false;
                 }
             }
-            !args
-                .iter()
-                .any(|a| arg_is(a, "--config") || a.starts_with("-Z") || a.contains("runner"))
+            !args.iter().any(|a| {
+                arg_is(a, "--config")
+                    || a.starts_with("-Z")
+                    || a.contains("runner")
+                    || a.contains("program")
+                    || arg_is(a, "--pre")
+            })
         }
         "git" => parse_git_allow(args, root),
         "rg" => {
@@ -714,6 +716,9 @@ fn schema_allows(argv: &[String], root: &str) -> bool {
                     }
                     return false;
                 }
+                if !path_value_inside_root(root, a) {
+                    return false;
+                }
                 i += 1;
             }
             true
@@ -725,14 +730,13 @@ fn schema_allows(argv: &[String], root: &str) -> bool {
 fn hard_allow(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
     for prefix in &rules.allow {
         if argv_prefix_match(argv, prefix) {
-            let prog = program_basename(argv.first().map(String::as_str).unwrap_or(""));
-            if matches!(prog, "cargo" | "git" | "rg") {
-                if schema_allows(argv, root) {
-                    return Some(Verdict::Allow);
-                }
-                return None;
+            if schema_allows(argv, root) {
+                return Some(Verdict::Allow);
             }
-            return Some(Verdict::Allow);
+            if argv.len() == prefix.len() {
+                return Some(Verdict::Allow);
+            }
+            return None;
         }
     }
     if schema_allows(argv, root) {
@@ -975,9 +979,22 @@ impl Gate {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
     use super::*;
 
-    const TEST_ROOT: &str = "/tmp/toolgate-allow-root";
+    fn test_root() -> &'static str {
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let p =
+                std::env::temp_dir().join(format!("toolgate-allow-root-{}", std::process::id()));
+            std::fs::create_dir_all(&p).expect("test root");
+            p
+        })
+        .to_str()
+        .expect("utf8 root")
+    }
 
     #[test]
     fn policy_matches_article_numbers() {
@@ -995,7 +1012,7 @@ mod tests {
         let rules = Rules::default();
         let argv = vec!["cargo".into(), "test".into(), "-p".into(), "foo".into()];
         assert!(matches!(
-            rules_verdict(&argv, &rules, TEST_ROOT),
+            rules_verdict(&argv, &rules, test_root()),
             Some(Verdict::Allow)
         ));
     }
@@ -1011,7 +1028,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    rules_verdict(&argv, &rules, test_root()),
                     Some(Verdict::Block(_))
                 ),
                 "{argv:?}"
@@ -1054,7 +1071,7 @@ mod tests {
         ];
         for argv in cases {
             assert!(
-                rules_verdict(&argv, &rules, TEST_ROOT).is_none(),
+                rules_verdict(&argv, &rules, test_root()).is_none(),
                 "{argv:?}"
             );
         }
@@ -1065,7 +1082,7 @@ mod tests {
         let rules = Rules::default();
         let argv = vec!["git".into(), "status".into()];
         assert!(matches!(
-            rules_verdict(&argv, &rules, TEST_ROOT),
+            rules_verdict(&argv, &rules, test_root()),
             Some(Verdict::Allow)
         ));
     }
@@ -1090,7 +1107,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    rules_verdict(&argv, &rules, test_root()),
                     Some(Verdict::Block(_))
                 ),
                 "{argv:?}"
@@ -1105,21 +1122,26 @@ mod tests {
             deny: vec![vec!["wget".into()]],
         };
         assert!(matches!(
-            rules_verdict(&vec!["echo".into(), "hi".into()], &rules, TEST_ROOT),
+            rules_verdict(&vec!["echo".into()], &rules, test_root()),
             Some(Verdict::Allow)
         ));
+        assert!(rules_verdict(&vec!["echo".into(), "hi".into()], &rules, test_root()).is_none());
         assert!(matches!(
-            rules_verdict(&vec!["wget".into(), "https://x".into()], &rules, TEST_ROOT),
+            rules_verdict(
+                &vec!["wget".into(), "https://x".into()],
+                &rules,
+                test_root()
+            ),
             Some(Verdict::Block(_))
         ));
-        assert!(rules_verdict(&vec!["curl".into(), "x".into()], &rules, TEST_ROOT).is_none());
+        assert!(rules_verdict(&vec!["curl".into(), "x".into()], &rules, test_root()).is_none());
     }
 
     #[test]
     fn rules_unknown_needs_jev() {
         let rules = Rules::default();
         let argv = vec!["curl".into(), "https://example.com".into()];
-        assert!(rules_verdict(&argv, &rules, TEST_ROOT).is_none());
+        assert!(rules_verdict(&argv, &rules, test_root()).is_none());
     }
 
     #[test]
@@ -1159,7 +1181,7 @@ mod tests {
         for argv in cases {
             assert!(
                 matches!(
-                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    rules_verdict(&argv, &rules, test_root()),
                     Some(Verdict::Block(_))
                 ),
                 "{argv:?}"
@@ -1171,7 +1193,7 @@ mod tests {
     fn git_unknown_global_never_allow() {
         let rules = Rules::default();
         let argv = vec!["git".into(), "--weird-global".into(), "status".into()];
-        assert!(rules_verdict(&argv, &rules, TEST_ROOT).is_none());
+        assert!(rules_verdict(&argv, &rules, test_root()).is_none());
     }
 
     #[test]
@@ -1182,7 +1204,7 @@ mod tests {
         };
         let argv = vec!["git".into(), "push".into(), "-f".into()];
         assert!(matches!(
-            rules_verdict(&argv, &rules, TEST_ROOT),
+            rules_verdict(&argv, &rules, test_root()),
             Some(Verdict::Block(_))
         ));
     }
@@ -1192,7 +1214,7 @@ mod tests {
         let rules = Rules::default();
         let argv = vec!["git".into(), "-pp".into(), "push".into(), "--force".into()];
         assert!(matches!(
-            rules_verdict(&argv, &rules, TEST_ROOT),
+            rules_verdict(&argv, &rules, test_root()),
             Some(Verdict::Block(_))
         ));
     }
@@ -1204,7 +1226,7 @@ mod tests {
             vec!["git".into(), "-".into(), "diff".into()],
             vec!["git".into(), "-".into(), "push".into(), "-f".into()],
         ] {
-            let v = rules_verdict(&argv, &rules, TEST_ROOT);
+            let v = rules_verdict(&argv, &rules, test_root());
             if argv.contains(&"-f".into()) || argv.iter().any(|a| a == "push") {
                 assert!(matches!(v, Some(Verdict::Block(_))), "{argv:?}");
             } else {
@@ -1227,7 +1249,7 @@ mod tests {
             "origin".into(),
         ];
         assert!(matches!(
-            rules_verdict(&argv, &rules, TEST_ROOT),
+            rules_verdict(&argv, &rules, test_root()),
             Some(Verdict::Block(_))
         ));
     }
@@ -1235,6 +1257,7 @@ mod tests {
     #[test]
     fn cargo_paths_outside_root_need_jev() {
         let rules = Rules::default();
+        let root = test_root();
         let outside = "/outside/Cargo.toml";
         for argv in [
             vec![
@@ -1249,12 +1272,72 @@ mod tests {
                 "--target-dir".into(),
                 "/outside".into(),
             ],
+            vec![
+                "cargo".into(),
+                "test".into(),
+                "--manifest-path".into(),
+                "../outside/Cargo.toml".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "build".into(),
+                "--target-dir".into(),
+                "../out".into(),
+            ],
+            vec![
+                "cargo".into(),
+                "build".into(),
+                "--target-dir".into(),
+                format!("{root}/../../tmp/new"),
+            ],
         ] {
-            assert!(
-                rules_verdict(&argv, &rules, TEST_ROOT).is_none(),
-                "{argv:?}"
-            );
+            assert!(rules_verdict(&argv, &rules, root).is_none(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn git_config_injection_globals_not_allowed() {
+        let rules = Rules::default();
+        let root = test_root();
+        for argv in [
+            vec![
+                "git".into(),
+                "-c".into(),
+                "diff.external=/bin/sh".into(),
+                "diff".into(),
+            ],
+            vec![
+                "git".into(),
+                "-c".into(),
+                "core.fsmonitor=/bin/sh".into(),
+                "status".into(),
+            ],
+            vec![
+                "git".into(),
+                "--config-env".into(),
+                "X=Y".into(),
+                "status".into(),
+            ],
+        ] {
+            assert!(rules_verdict(&argv, &rules, root).is_none(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn ls_with_flags_outside_root_not_allowed() {
+        let rules = Rules::default();
+        let argv = vec!["ls".into(), "-R".into(), "/etc".into()];
+        assert!(rules_verdict(&argv, &rules, test_root()).is_none());
+    }
+
+    #[test]
+    fn inside_root_rejects_symlink_escape() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let root = root_dir.path();
+        let outside = tempfile::tempdir().expect("outside");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        assert!(crate::read::inside_root(root, "link/nested").is_none());
     }
 
     #[test]
@@ -1264,7 +1347,7 @@ mod tests {
             rules_verdict(
                 &vec!["rg".into(), "fn".into(), "src".into()],
                 &rules,
-                TEST_ROOT
+                test_root()
             ),
             Some(Verdict::Allow)
         ));
@@ -1273,7 +1356,7 @@ mod tests {
             vec!["rg".into(), "--pre-glob".into(), "*.sh".into()],
         ] {
             assert!(
-                rules_verdict(&argv, &rules, TEST_ROOT).is_none(),
+                rules_verdict(&argv, &rules, test_root()).is_none(),
                 "{argv:?}"
             );
         }
@@ -1291,7 +1374,7 @@ mod tests {
         for argv in allow_cases {
             assert!(
                 matches!(
-                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    rules_verdict(&argv, &rules, test_root()),
                     Some(Verdict::Allow)
                 ),
                 "{argv:?}"
@@ -1308,9 +1391,9 @@ mod tests {
             "-p".into(),
             "foo".into(),
             "--manifest-path".into(),
-            format!("{TEST_ROOT}/Cargo.toml"),
+            format!("{}/Cargo.toml", test_root()),
             "--target-dir".into(),
-            format!("{TEST_ROOT}/target"),
+            format!("{}/target", test_root()),
             "--pre".into(),
             "--output=x".into(),
             "-".into(),
@@ -1321,6 +1404,10 @@ mod tests {
             "-f".into(),
             "+ref".into(),
             "/outside/x".into(),
+            "../x".into(),
+            format!("{}/../../x", test_root()),
+            "-c".into(),
+            "k=v".into(),
         ];
         let mut rng_state: u64 = 0xDEAD_BEEF;
         for _ in 0..200 {
@@ -1332,10 +1419,10 @@ mod tests {
                 argv.push(pool[idx].clone());
             }
             let steps_before = argv.len();
-            let v = rules_verdict(&argv, &rules, TEST_ROOT);
+            let v = rules_verdict(&argv, &rules, test_root());
             assert!(steps_before <= 16);
             if matches!(v, Some(Verdict::Allow)) {
-                assert!(schema_allows(&argv, TEST_ROOT), "{argv:?}");
+                assert!(schema_allows(&argv, test_root()), "{argv:?}");
             }
         }
     }

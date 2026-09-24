@@ -73,16 +73,25 @@ toolgate v0.1.0
 | 4 | `Rules.deny` on raw argv; unsafe git/cargo flags allowed | Deny uses normalized git tokens; block `--output`/`--textconv`/`--ext-diff`; cargo paths outside root fail closed |
 | 5 | `rg --pre` handling | `--pre`/`--pre-glob` not in schema (Jev); safe `rg` still Allow |
 
+## Review round 5 (Grok NO-GO)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | Relative and lexical-escape cargo paths skipped root checks | Shared [`read::inside_root`](src/read.rs): lexical `..` rejection, then canonical longest-existing ancestor under canonical root; all schema path flags and `ls` positionals use it |
+| 2 | String-prefix fallback when `canonicalize` failed | Removed; no prefix checks |
+| 3 | Git `-c` / `--config` / `--config-env` / `--exec-path` on allow path | Dropped from globals; `-c` routes unknown; cargo `--config`/`-Z`/`--pre`/`program` flags fail closed |
+| 4 | `Rules.allow` for `ls` etc. bypassed schema | Every allow match requires `schema_allows` or bare program-only prefix (`argv.len() == prefix.len()`) |
+
 ## Gate output (tail)
 
 ```
-running 47 tests
-...............................................
-test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+running 51 tests
+...................................................
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
 
-running 40 tests
-........................................
-test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+running 44 tests
+............................................
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
 ```
 
 (`cargo fmt --check` clean.)
