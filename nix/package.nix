@@ -5,6 +5,7 @@
   rustPlatform,
   cmake,
   pkg-config,
+  cacert,
 }:
 
 rustPlatform.buildRustPackage {
@@ -36,12 +37,12 @@ rustPlatform.buildRustPackage {
 
   doCheck = true;
 
-  # Nix check sandbox has no network (loopback HTTP for mock TypeSafe API).
-  cargoTestFlags = [
-    "--"
-    "--skip"
-    "judge_round_trips_systemone_wire"
-  ];
+  # reqwest's TLS backend fails to build a client without a CA bundle,
+  # even for the loopback mock TypeSafe API used by the Jev tests.
+  nativeCheckInputs = [ cacert ];
+  preCheck = ''
+    export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt
+  '';
 
   meta = with lib; {
     description = "Harness-side guardrails: capped file reads and related gates";
