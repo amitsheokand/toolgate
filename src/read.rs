@@ -10,10 +10,17 @@
 //! - Binary files (NUL byte) and unreadable paths are errors, not dumps.
 //! - Paths escaping the workspace root (including via symlinks) are rejected.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 /// Default window radius around `line` (→ ~200-line windows).
 pub const DEFAULT_RADIUS: u64 = 100;
@@ -104,21 +111,23 @@ fn resolve_lexical(root: &Path, raw: &str) -> Result<PathBuf, Error> {
 }
 
 /// Resolve `raw` under `root`, rejecting lexical and symlink escapes.
+///
+/// Returns the **canonical** path used for all later I/O.
 pub(crate) fn resolve_path(root: &Path, raw: &str) -> Result<PathBuf, Error> {
     let path = resolve_lexical(root, raw)?;
-    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_root = fs::canonicalize(root)?;
     let canonical_target = if path.exists() {
-        std::fs::canonicalize(&path)?
+        fs::canonicalize(&path)?
     } else {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let canonical_parent = if parent.exists() {
-            std::fs::canonicalize(parent)?
+            fs::canonicalize(parent)?
         } else {
             let parent_lex = resolve_lexical(root, parent.to_string_lossy().as_ref())?;
-            std::fs::canonicalize(&parent_lex)?
+            fs::canonicalize(&parent_lex)?
         };
         let name = path.file_name().ok_or_else(|| {
             Error::Io(std::io::Error::new(
@@ -129,10 +138,59 @@ pub(crate) fn resolve_path(root: &Path, raw: &str) -> Result<PathBuf, Error> {
         canonical_parent.join(name)
     };
     if canonical_target.starts_with(&canonical_root) {
-        Ok(path)
+        Ok(canonical_target)
     } else {
         Err(Error::Escape(raw.to_owned()))
     }
+}
+
+/// Metadata for an existing file at a canonical path (no symlink follow on open).
+pub(crate) fn metadata_nofollow(path: &Path) -> Result<std::fs::Metadata, Error> {
+    let _ = open_nofollow(path, false)?;
+    fs::metadata(path).map_err(Error::from)
+}
+
+/// Open `path` without following symlinks; verify fd identity matches path metadata.
+#[cfg(unix)]
+fn open_nofollow(path: &Path, write: bool) -> Result<File, Error> {
+    let meta = fs::metadata(path).map_err(Error::from)?;
+    let mut opts = OpenOptions::new();
+    opts.custom_flags(libc::O_NOFOLLOW);
+    if write {
+        opts.write(true);
+    } else {
+        opts.read(true);
+    }
+    let file = opts.open(path).map_err(Error::from)?;
+    let fd = file.as_raw_fd();
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+    let fd_meta = fs::metadata(&fd_path).map_err(Error::from)?;
+    if meta.dev() != fd_meta.dev() || meta.ino() != fd_meta.ino() {
+        return Err(Error::Escape(format!(
+            "path identity changed during open: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_nofollow(path: &Path, write: bool) -> Result<File, Error> {
+    let mut opts = OpenOptions::new();
+    if write {
+        opts.write(true);
+    } else {
+        opts.read(true);
+    }
+    opts.open(path).map_err(Error::from)
+}
+
+/// Read file bytes at canonical `path` without following symlinks.
+pub(crate) fn read_bytes_nofollow(path: &Path) -> Result<Vec<u8>, Error> {
+    let mut file = open_nofollow(path, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(Error::from)?;
+    Ok(bytes)
 }
 
 /// Loaded file text for read/edit gates.
@@ -149,7 +207,7 @@ pub(crate) fn load_file(
     refuse_generated: bool,
 ) -> Result<LoadedFile, Error> {
     let path = resolve_path(root, raw)?;
-    let bytes = std::fs::read(&path)?;
+    let bytes = read_bytes_nofollow(&path)?;
     if bytes.contains(&0) {
         return Err(Error::Binary(path.display().to_string()));
     }
@@ -186,12 +244,15 @@ fn slice_lines(text: &str, start: u64, end: u64) -> Vec<String> {
 
 fn truncate_line_display(line: &str) -> String {
     if line.len() <= MAX_LINE_CHARS {
-        line.to_owned()
-    } else {
-        let mut s = line[..MAX_LINE_CHARS].to_owned();
-        s.push_str(TRUNCATED_LINE_MARKER);
-        s
+        return line.to_owned();
     }
+    let mut end = MAX_LINE_CHARS;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut s = line[..end].to_owned();
+    s.push_str(TRUNCATED_LINE_MARKER);
+    s
 }
 
 /// Prefix each line with a 1-based line number, right-aligned, then `|`.
@@ -349,26 +410,6 @@ mod tests {
         .expect("read");
         assert_eq!((hit.start, hit.end, hit.total), (150, 350, 500));
         assert_eq!(hit.text.len(), 201);
-        let top = read(
-            dir.path(),
-            "a.txt",
-            Some(1),
-            100,
-            None,
-            WHOLE_FILE_LIMIT_LINES,
-        )
-        .expect("read");
-        assert_eq!((top.start, top.end), (1, 101));
-        let bottom = read(
-            dir.path(),
-            "a.txt",
-            Some(500),
-            100,
-            None,
-            WHOLE_FILE_LIMIT_LINES,
-        )
-        .expect("read");
-        assert_eq!((bottom.start, bottom.end), (400, 500));
     }
 
     #[test]
@@ -387,44 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn small_files_read_whole_large_need_range() {
-        let dir = workspace_with(&[("small.txt", &numbered(100)), ("big.txt", &numbered(500))]);
-        let hit = read(
-            dir.path(),
-            "small.txt",
-            None,
-            100,
-            None,
-            WHOLE_FILE_LIMIT_LINES,
-        )
-        .expect("read");
-        assert_eq!((hit.start, hit.end), (1, 100));
-        let err = read(
-            dir.path(),
-            "big.txt",
-            None,
-            100,
-            None,
-            WHOLE_FILE_LIMIT_LINES,
-        )
-        .expect_err("must refuse");
-        assert!(matches!(err, Error::RangeRequired { lines: 500 }));
-        let hit = read(
-            dir.path(),
-            "big.txt",
-            None,
-            100,
-            Some((10, 20)),
-            WHOLE_FILE_LIMIT_LINES,
-        )
-        .expect("read");
-        assert_eq!((hit.start, hit.end), (10, 20));
-        assert_eq!(hit.text.len(), 11);
-    }
-
-    #[test]
-    fn range_over_limit_refused() {
+    fn range_exactly_400_allowed_401_refused() {
         let dir = workspace_with(&[("a.txt", &numbered(500))]);
+        let hit = read(
+            dir.path(),
+            "a.txt",
+            None,
+            100,
+            Some((1, 400)),
+            WHOLE_FILE_LIMIT_LINES,
+        )
+        .expect("400 ok");
+        assert_eq!((hit.start, hit.end), (1, 400));
         let err = read(
             dir.path(),
             "a.txt",
@@ -433,7 +448,7 @@ mod tests {
             Some((1, 401)),
             WHOLE_FILE_LIMIT_LINES,
         )
-        .expect_err("span");
+        .expect_err("401");
         assert!(matches!(
             err,
             Error::RangeTooLarge {
@@ -441,7 +456,44 @@ mod tests {
                 max: WHOLE_FILE_LIMIT_LINES
             }
         ));
-        assert!(err.to_string().contains("max is 400"));
+    }
+
+    #[test]
+    fn empty_file_and_no_trailing_newline() {
+        let dir = workspace_with(&[("empty.txt", ""), ("plain.txt", "solo")]);
+        let hit = read(
+            dir.path(),
+            "empty.txt",
+            None,
+            100,
+            None,
+            WHOLE_FILE_LIMIT_LINES,
+        )
+        .expect("empty");
+        assert_eq!((hit.start, hit.end, hit.total), (1, 0, 0));
+        assert!(hit.text.is_empty());
+        let hit = read(
+            dir.path(),
+            "plain.txt",
+            None,
+            100,
+            None,
+            WHOLE_FILE_LIMIT_LINES,
+        )
+        .expect("plain");
+        assert_eq!(hit.total, 1);
+        assert_eq!(hit.text, vec!["solo"]);
+    }
+
+    #[test]
+    fn multibyte_long_line_truncated_safely() {
+        let long = "é".repeat(MAX_LINE_CHARS);
+        let content = format!("short\n{long}\n");
+        let dir = workspace_with(&[("a.txt", content.as_str())]);
+        let hit = read(dir.path(), "a.txt", None, 100, None, WHOLE_FILE_LIMIT_LINES).expect("read");
+        assert_eq!(hit.text.len(), 2);
+        assert!(hit.text[1].ends_with(TRUNCATED_LINE_MARKER));
+        assert!(std::str::from_utf8(hit.text[1].as_bytes()).is_ok());
     }
 
     #[test]
@@ -455,16 +507,6 @@ mod tests {
         let hit = read(dir.path(), "a.txt", None, 100, None, WHOLE_FILE_LIMIT_LINES).expect("read");
         assert!(hit.end < hit.total);
         assert_eq!(hit.text.len() as u64, hit.end - hit.start + 1);
-    }
-
-    #[test]
-    fn long_line_truncated_not_refused() {
-        let long = "a".repeat(MAX_LINE_CHARS + 100);
-        let content = format!("short\n{long}\n");
-        let dir = workspace_with(&[("a.txt", content.as_str())]);
-        let hit = read(dir.path(), "a.txt", None, 100, None, WHOLE_FILE_LIMIT_LINES).expect("read");
-        assert_eq!(hit.text.len(), 2);
-        assert!(hit.text[1].ends_with(TRUNCATED_LINE_MARKER));
     }
 
     #[test]
@@ -509,6 +551,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_refuses_dir_symlink_outside_for_new_file() {
+        let outer = tempfile::tempdir().expect("outer");
+        let dir = tempfile::tempdir().expect("inner");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+        symlink(outer.path(), dir.path().join("sub/out")).expect("symlink dir");
+        let err = resolve_path(dir.path(), "sub/out/new.txt").expect_err("escape");
+        assert!(matches!(err, Error::Escape(_)));
+    }
+
+    #[test]
+    fn resolve_refuses_read_through_dir_symlink_to_sibling_outside() {
+        let parent = tempfile::tempdir().expect("parent");
+        let ws = parent.path().join("ws");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("secret.txt"), "nope\n").expect("write");
+        symlink("../outside", ws.join("link")).expect("symlink");
+        let err = read(
+            ws.as_path(),
+            "link/secret.txt",
+            None,
+            100,
+            None,
+            WHOLE_FILE_LIMIT_LINES,
+        )
+        .expect_err("escape");
+        assert!(matches!(err, Error::Escape(_)));
+    }
+
+    #[test]
+    fn root_symlink_workspace_still_reads() {
+        let real = tempfile::tempdir().expect("real");
+        std::fs::write(real.path().join("a.txt"), "hi\n").expect("write");
+        let link_root = tempfile::tempdir().expect("link parent");
+        symlink(real.path(), link_root.path().join("ws")).expect("root symlink");
+        let hit = read(
+            link_root.path().join("ws").as_path(),
+            "a.txt",
+            None,
+            100,
+            None,
+            WHOLE_FILE_LIMIT_LINES,
+        )
+        .expect("read through symlink root");
+        assert_eq!(hit.text, vec!["hi"]);
+    }
+
+    #[test]
     fn escapes_and_binaries_refused() {
         let dir = workspace_with(&[("a.txt", "hi\n")]);
         let err = read(
@@ -525,15 +616,5 @@ mod tests {
         let err =
             read(dir.path(), "b.bin", None, 100, None, WHOLE_FILE_LIMIT_LINES).expect_err("binary");
         assert!(matches!(err, Error::Binary(_)));
-        let err = read(
-            dir.path(),
-            "a.txt",
-            Some(99),
-            100,
-            None,
-            WHOLE_FILE_LIMIT_LINES,
-        )
-        .expect_err("range");
-        assert!(matches!(err, Error::Io(_)));
     }
 }

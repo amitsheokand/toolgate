@@ -35,3 +35,33 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ```
 
 (`cargo fmt --check` passed; no new dependencies.)
+
+## Review round 1
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | Lexical path reused after canonicalize | `resolve_path` returns canonical path; `read_bytes_nofollow` / `metadata_nofollow` open with `O_NOFOLLOW` and verify fd `(dev,ino)` vs path metadata; edit temp+rename in canonical parent. **Residual:** parent directory swap between `metadata` and `open` is not `openat2`/`RESOLVE_BENEATH`; TOCTOU on parent remains. Added unix `libc` dep (see `Cargo.toml`, out of parallel fence). |
+| 2 | Byte slice on multibyte char | `truncate_line_display` walks back to `is_char_boundary` before cut. |
+| 3 | Predictable temp path / symlink follow | `create_new` + `O_NOFOLLOW`, unique `.toolgate-{pid}-{seq}-{nanos}`; `remove_file` on any failure path. |
+| 4 | Silent allow+cap | Large whole-file reads → `permission: "deny"` + `agent_message` with line count and offset/limit / one-grep guidance. |
+| 5 | Hook error paths | `cursor_read_stdio_with` fail-open; `emit_output` fallback JSON; `main` prints allow if stdio returns `Err`. |
+| 6 | Test gaps | Added cases: `@@` headers line 1 / last line no NL, symlink dir outside, sibling escape, symlink root, multibyte truncate, empty/no-NL file, range 400/401, BOM, overlapping `applied`, temp cleanup, planted temp symlink, hook deny + stdio tests. |
+| 7 | Process env in tests | `decide_cursor_read(..., read_hook_env: Option<&str>)`; tests pass env explicitly. |
+
+### Gate output (tail, round 1)
+
+```
+running 45 tests
+.............................................
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```

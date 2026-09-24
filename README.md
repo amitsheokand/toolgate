@@ -60,9 +60,10 @@ Register in `~/.cursor/hooks.json` (merge with your existing hooks):
 }
 ```
 
-Whole-file reads of files over 400 lines get `limit: 400` via
-`updated_input` (offset/limit reads pass through). Set
-`TOOLGATE_READ_HOOK=0` to disable. The hook always exits 0.
+Whole-file reads of files over 400 lines are **denied** with an
+`agent_message` naming the line count (offset/limit reads pass through).
+Set `TOOLGATE_READ_HOOK=0` to disable. The hook always exits 0 and prints
+exactly one JSON object; I/O or parse failures emit `{"permission":"allow"}`.
 
 ## Gates
 

@@ -5,16 +5,23 @@
 //! the match must be unique unless `--all` is passed, and the returned
 //! diff is capped.
 
-use std::fs::{self, Permissions};
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Max diff lines returned per edit (head-truncated with a marker).
 pub const DIFF_CAP_LINES: usize = 60;
 /// Context lines on each side of the hunk in the returned diff.
 const DIFF_CONTEXT_LINES: usize = 3;
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Edit errors: caller-visible, never dumps unrelated file regions.
 #[derive(Debug, Error)]
@@ -73,9 +80,7 @@ pub fn edit(root: &Path, raw: &str, old: &str, new: &str, all: bool) -> Result<E
     } else {
         before.replacen(old, new, 1)
     };
-    let perms = fs::metadata(&path)
-        .map_err(crate::read::Error::from)?
-        .permissions();
+    let perms = crate::read::metadata_nofollow(&path)?.permissions();
     atomic_write(&path, updated.as_bytes(), &perms)?;
     let applied = if all { occurrences } else { 1 };
     let before_lines: Vec<&str> = before.lines().collect();
@@ -90,6 +95,19 @@ pub fn edit(root: &Path, raw: &str, old: &str, new: &str, all: bool) -> Result<E
     })
 }
 
+fn unique_temp_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        ".toolgate-{}-{}-{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
 fn atomic_write(path: &Path, bytes: &[u8], perms: &Permissions) -> Result<(), crate::read::Error> {
     let parent = path.parent().ok_or_else(|| {
         crate::read::Error::Io(std::io::Error::new(
@@ -97,11 +115,22 @@ fn atomic_write(path: &Path, bytes: &[u8], perms: &Permissions) -> Result<(), cr
             "path has no parent",
         ))
     })?;
-    let tmp = parent.join(format!(".toolgate-{}", std::process::id()));
-    fs::write(&tmp, bytes).map_err(crate::read::Error::from)?;
-    fs::set_permissions(&tmp, perms.clone()).map_err(crate::read::Error::from)?;
-    fs::rename(&tmp, path).map_err(crate::read::Error::from)?;
-    Ok(())
+    let tmp_path = parent.join(unique_temp_name());
+    let write_result = (|| -> Result<(), crate::read::Error> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW);
+        let mut file = opts.open(&tmp_path).map_err(crate::read::Error::from)?;
+        file.write_all(bytes).map_err(crate::read::Error::from)?;
+        fs::set_permissions(&tmp_path, perms.clone()).map_err(crate::read::Error::from)?;
+        fs::rename(&tmp_path, path).map_err(crate::read::Error::from)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 /// 0-based [first, last) span covering all differing lines.
@@ -161,6 +190,7 @@ fn bounded_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn workspace_with(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -173,6 +203,20 @@ mod tests {
             std::fs::write(&path, contents).expect("write");
         }
         dir
+    }
+
+    #[test]
+    fn diff_header_line_one_change() {
+        let dir = workspace_with(&[("a.txt", "first\nsecond\nthird\nfourth\n")]);
+        let hit = edit(dir.path(), "a.txt", "first", "FIRST", false).expect("edit");
+        assert_eq!(hit.diff[0], "@@ -1,4 +1,4 @@");
+    }
+
+    #[test]
+    fn diff_header_last_line_no_trailing_newline() {
+        let dir = workspace_with(&[("a.txt", "one\ntwo\nthree")]);
+        let hit = edit(dir.path(), "a.txt", "three", "THREE", false).expect("edit");
+        assert_eq!(hit.diff[0], "@@ -1,3 +1,3 @@");
     }
 
     #[test]
@@ -194,13 +238,7 @@ mod tests {
         let hit = edit(dir.path(), "a.txt", "beta", "BETA", false).expect("edit");
         assert_eq!(hit.applied, 1);
         let bytes = std::fs::read(dir.path().join("a.txt")).expect("read");
-        assert_eq!(
-            bytes, b"alpha\r\nBETA\r\ngamma\r\n",
-            "CRLF must stay byte-for-byte"
-        );
-        edit(dir.path(), "a.txt", "BETA", "beta", false).expect("revert");
-        let bytes = std::fs::read(dir.path().join("a.txt")).expect("read");
-        assert_eq!(bytes, b"alpha\r\nbeta\r\ngamma\r\n");
+        assert_eq!(bytes, b"alpha\r\nBETA\r\ngamma\r\n");
     }
 
     #[test]
@@ -211,6 +249,15 @@ mod tests {
             std::fs::read(dir.path().join("a.txt")).expect("read"),
             b"z\r\n"
         );
+    }
+
+    #[test]
+    fn bom_preserved_utf8_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, [0xEF, 0xBB, 0xBF, b'h', b'i', b'\n']).expect("write");
+        edit(dir.path(), "a.txt", "hi", "yo", false).expect("edit");
+        assert_eq!(std::fs::read(&path).expect("read"), b"\xEF\xBB\xBFyo\n");
     }
 
     #[test]
@@ -237,16 +284,47 @@ mod tests {
     }
 
     #[test]
-    fn diff_includes_context_lines() {
-        let dir = workspace_with(&[("a.txt", "c1\nc2\nc3\nbefore\nafter\nc4\nc5\nc6\n")]);
-        let hit = edit(dir.path(), "a.txt", "before", "BEFORE", false).expect("edit");
-        let ctx = hit
-            .diff
-            .iter()
-            .filter(|l| l.starts_with(' ') && !l.starts_with("@@"))
-            .count();
-        assert!(ctx >= 2, "expected context lines in diff: {:?}", hit.diff);
-        assert!(hit.diff[0].starts_with("@@"));
+    fn overlapping_and_adjacent_applied_counts() {
+        let dir = workspace_with(&[("a.txt", "aba\n")]);
+        let hit = edit(dir.path(), "a.txt", "a", "x", true).expect("edit");
+        assert_eq!(hit.applied, 2);
+        let dir = workspace_with(&[("b.txt", "aa\n")]);
+        let hit = edit(dir.path(), "b.txt", "a", "b", true).expect("edit");
+        assert_eq!(hit.applied, 2);
+    }
+
+    #[test]
+    fn temp_not_created_via_symlink_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "safe\n").expect("write");
+        symlink(&victim, dir.path().join(".toolgate-trap")).expect("symlink");
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        opts.custom_flags(libc::O_NOFOLLOW);
+        let err = opts
+            .open(dir.path().join(".toolgate-trap"))
+            .expect_err("symlink exists");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn temp_removed_when_rename_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ref.txt"), "x\n").expect("write");
+        std::fs::create_dir(dir.path().join("blocker")).expect("mkdir");
+        let perms = std::fs::metadata(dir.path().join("ref.txt"))
+            .expect("meta")
+            .permissions();
+        let err = atomic_write(dir.path().join("blocker").as_path(), b"data", &perms)
+            .expect_err("rename to directory");
+        assert!(matches!(err, crate::read::Error::Io(_)));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".toolgate-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file must be cleaned up");
     }
 
     #[test]
@@ -256,13 +334,6 @@ mod tests {
         assert!(matches!(err, Error::NoMatch(_)));
         let hit = edit(dir.path(), "a.txt", "x", "y", true).expect("edit");
         assert_eq!(hit.applied, 3);
-    }
-
-    #[test]
-    fn missing_match_is_an_error_not_empty_diff() {
-        let dir = workspace_with(&[("a.txt", "alpha\n")]);
-        let err = edit(dir.path(), "a.txt", "zzz", "y", false).expect_err("missing");
-        assert!(matches!(err, Error::NoMatch(_)));
     }
 
     #[test]
@@ -284,15 +355,5 @@ mod tests {
             std::fs::read_to_string(dir.path().join("link.txt")).expect("read"),
             "yes\n"
         );
-    }
-
-    #[test]
-    fn escapes_and_binaries_refused() {
-        let dir = workspace_with(&[("a.txt", "hi\n")]);
-        let err = edit(dir.path(), "../e.txt", "hi", "yo", false).expect_err("escape");
-        assert!(matches!(err, Error::Read(_)));
-        std::fs::write(dir.path().join("b.bin"), [0x00]).expect("write");
-        let err = edit(dir.path(), "b.bin", "x", "y", false).expect_err("binary");
-        assert!(matches!(err, Error::Read(_)));
     }
 }

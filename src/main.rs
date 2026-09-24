@@ -125,7 +125,10 @@ async fn main() -> Result<()> {
         Command::Hook {
             hook: HookCommand::CursorRead,
         } => {
-            toolgate::hook::cursor_read_stdio()?;
+            if toolgate::hook::cursor_read_stdio().is_err() {
+                println!(r#"{{"permission":"allow"}}"#);
+            }
+            return Ok(());
         }
         Command::Serve { .. } => {
             toolgate::mcp::serve_stdio().await?;
