@@ -11,7 +11,9 @@ search, never a gatekeeper.
 
 ```bash
 toolgate read <file> [--line N] [--radius R] [--start M --end K] [--root <dir>]
-toolgate serve  # MCP stdio server (`read` tool)
+toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]  # prints its diff
+toolgate run <program> [args...] [--root <dir>] [--timeout S]          # argv-direct
+toolgate serve  # MCP stdio server (`read`, `edit`, `run`)
 ```
 
 - `--line N`: ~200-line window around N (default radius 100), clamped.

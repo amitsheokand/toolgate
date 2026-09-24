@@ -34,6 +34,32 @@ fn invalid(e: impl std::fmt::Display) -> McpError {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RunParams {
+    /// Absolute workspace root (working directory).
+    root: String,
+    /// Program to execute (argv-direct, no shell).
+    program: String,
+    /// Arguments.
+    args: Option<Vec<String>>,
+    /// Wall-clock budget in seconds (default 120).
+    timeout: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EditParams {
+    /// Absolute workspace root.
+    root: String,
+    /// File to edit, relative to root or absolute.
+    path: String,
+    /// Exact text to replace (must match once unless `all`).
+    old: String,
+    /// Replacement text.
+    new: String,
+    /// Replace every occurrence instead of requiring exactly one.
+    all: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ReadParams {
     /// Absolute workspace root.
     root: String,
@@ -102,6 +128,58 @@ impl ToolGate {
         out.push_str(&hit.text.join("\n"));
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
+
+    #[tool(
+        description = "Exact-string edit that returns its diff. `old` must match once (or pass `all`); the response is the bounded diff, so no re-read is needed to check the write."
+    )]
+    async fn edit(
+        &self,
+        Parameters(p): Parameters<EditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = check_root(&p.root)?;
+        let hit = crate::edit::edit(&root, &p.path, &p.old, &p.new, p.all.unwrap_or(false))
+            .map_err(invalid)?;
+        let mut out = format!(
+            "{}:{}-{} ({} applied)\n",
+            hit.path.display(),
+            hit.start,
+            hit.end,
+            hit.applied
+        );
+        out.push_str(&hit.diff.join("\n"));
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(
+        description = "Bounded command execution: kills on timeout, head-truncates output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell."
+    )]
+    async fn run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
+        let root = check_root(&p.root)?;
+        let hit = crate::run::run(
+            &root,
+            &p.program,
+            &p.args.unwrap_or_default(),
+            p.timeout.unwrap_or(crate::run::DEFAULT_TIMEOUT_SECS),
+            crate::run::OUTPUT_CAP_BYTES,
+        )
+        .map_err(|e| match e {
+            crate::run::Error::Timeout(_) => McpError::internal_error(e.to_string(), None),
+            other => invalid(other),
+        })?;
+        let mut out = format!(
+            "exit={} timed_out={} elapsed_ms={}\n",
+            hit.code, hit.timed_out, hit.elapsed_ms
+        );
+        if !hit.stdout.is_empty() {
+            out.push_str("--- stdout ---\n");
+            out.push_str(&hit.stdout);
+        }
+        if !hit.stderr.is_empty() {
+            out.push_str("\n--- stderr ---\n");
+            out.push_str(&hit.stderr);
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
 }
 
 impl Default for ToolGate {
@@ -152,8 +230,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_router_lists_read() {
-        assert!(ToolGate::new().tool_router.map.contains_key("read"));
+    fn tool_router_lists_all_gates() {
+        let map = &ToolGate::new().tool_router.map;
+        for tool in ["read", "edit", "run"] {
+            assert!(map.contains_key(tool), "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_tool_applies_and_returns_diff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").expect("write");
+        let result = ToolGate::new()
+            .edit(Parameters(EditParams {
+                root: dir.path().to_string_lossy().into_owned(),
+                path: "a.txt".into(),
+                old: "beta".into(),
+                new: "BETA".into(),
+                all: None,
+            }))
+            .await
+            .expect("edit");
+        let text = serde_json::to_value(result).expect("response");
+        let body = text["content"][0]["text"].as_str().unwrap();
+        assert!(body.contains("(1 applied)"), "{body}");
+        assert!(body.contains("+BETA"), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("read"),
+            "alpha\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_reports_exit_and_truncates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = ToolGate::new()
+            .run(Parameters(RunParams {
+                root: dir.path().to_string_lossy().into_owned(),
+                program: "echo".into(),
+                args: Some(vec!["hi".into()]),
+                timeout: Some(10),
+            }))
+            .await
+            .expect("run");
+        let text = serde_json::to_value(result).expect("response");
+        let body = text["content"][0]["text"].as_str().unwrap();
+        assert!(body.contains("exit=0"), "{body}");
+        assert!(body.contains("hi"), "{body}");
     }
 
     #[tokio::test]

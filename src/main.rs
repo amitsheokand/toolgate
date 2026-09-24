@@ -32,6 +32,37 @@ enum Command {
     },
     /// Serve the MCP server over stdio.
     Serve {},
+    /// Bounded command execution (timeout + output budget).
+    Run {
+        /// Program to execute (argv-direct, no shell).
+        program: String,
+        /// Arguments.
+        #[arg(last = true)]
+        args: Vec<String>,
+        /// Workspace root (working directory).
+        #[arg(long, default_value = ".")]
+        root: std::path::PathBuf,
+        /// Wall-clock budget in seconds (default 120).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Exact-string edit that returns its diff (no re-read needed).
+    Edit {
+        /// File to edit.
+        path: std::path::PathBuf,
+        /// Workspace root escapes are checked against (default: cwd).
+        #[arg(long, default_value = ".")]
+        root: std::path::PathBuf,
+        /// Exact text to replace (must match once, or use `--all`).
+        #[arg(long)]
+        old: String,
+        /// Replacement text.
+        #[arg(long)]
+        new: String,
+        /// Replace every occurrence instead of requiring exactly one.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[tokio::main]
@@ -72,6 +103,50 @@ async fn main() -> Result<()> {
         }
         Command::Serve {} => {
             toolgate::mcp::serve_stdio().await?;
+        }
+        Command::Run {
+            program,
+            args,
+            root,
+            timeout,
+        } => {
+            let hit = toolgate::run::run(
+                &root,
+                &program,
+                &args,
+                timeout.unwrap_or(toolgate::run::DEFAULT_TIMEOUT_SECS),
+                toolgate::run::OUTPUT_CAP_BYTES,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "exit={} timed_out={} elapsed_ms={}",
+                hit.code, hit.timed_out, hit.elapsed_ms
+            );
+            if !hit.stdout.is_empty() {
+                println!("--- stdout ---\n{}", hit.stdout);
+            }
+            if !hit.stderr.is_empty() {
+                println!("--- stderr ---\n{}", hit.stderr);
+            }
+        }
+        Command::Edit {
+            path,
+            root,
+            old,
+            new,
+            all,
+        } => {
+            let raw = path.to_string_lossy().into_owned();
+            let hit = toolgate::edit::edit(&root, &raw, &old, &new, all)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "{}:{}-{} ({} applied)",
+                hit.path.display(),
+                hit.start,
+                hit.end,
+                hit.applied
+            );
+            println!("{}", hit.diff.join("\n"));
         }
     }
     Ok(())
