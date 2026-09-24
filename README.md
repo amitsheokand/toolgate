@@ -14,6 +14,25 @@ toolgate read <file> [--line N] [--radius R] [--start M --end K] [--root <dir>]
 toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]  # prints its diff
 toolgate run <program> [args...] [--root <dir>] [--timeout S]          # argv-direct
 toolgate serve  # MCP stdio server (`read`, `edit`, `run`)
+
+## Install
+
+```bash
+cargo install --git https://github.com/amitsheokand/toolgate
+toolgate install  # not yet: register manually for now
+```
+
+opencode (`~/.config/opencode/opencode.json`, preserves peers):
+
+```json
+{ "mcp": { "toolgate": {
+  "type": "local",
+  "command": ["/home/amitsheokand/.local/bin/toolgate", "serve", "--stdio"],
+  "enabled": true } } }
+```
+
+Restart the harness after (re)builds: the running server keeps serving
+its loaded image.
 ```
 
 - `--line N`: ~200-line window around N (default radius 100), clamped.

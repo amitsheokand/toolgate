@@ -220,6 +220,7 @@ impl Default for ToolGate {
 impl rmcp::ServerHandler for ToolGate {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        info.server_info.version = env!("CARGO_PKG_VERSION").to_owned();
         info.instructions = Some(
             "Harness-side guardrails. `read` returns bounded windows, never \
              unbounded whole-file dumps: pass `line` for a window around it, \

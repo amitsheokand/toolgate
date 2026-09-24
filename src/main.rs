@@ -31,7 +31,11 @@ enum Command {
         end: Option<u64>,
     },
     /// Serve the MCP server over stdio.
-    Serve {},
+    Serve {
+        /// Use stdio transport (the only transport; kept for uniformity).
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Bounded command execution (timeout + output budget).
     Run {
         /// Program to execute (argv-direct, no shell).
@@ -105,7 +109,7 @@ async fn main() -> Result<()> {
             );
             println!("{}", hit.text.join("\n"));
         }
-        Command::Serve {} => {
+        Command::Serve { .. } => {
             toolgate::mcp::serve_stdio().await?;
         }
         Command::Run {
