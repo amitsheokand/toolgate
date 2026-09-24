@@ -5,7 +5,7 @@
  */
 import { spawnSync } from "node:child_process";
 
-const bin = process.env.TOOLGATE_BIN ?? "toolgate";
+const bin = "@TOOLGATE_BIN@";
 
 function runHook(eventName, payload) {
   const child = spawnSync(

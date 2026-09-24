@@ -66,6 +66,7 @@
         in
         {
           toolgate = pkgs.toolgate;
+          home-manager-merge = import ./nix/checks/home-manager-merge.nix { inherit pkgs; };
         }
       );
 
