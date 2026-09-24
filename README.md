@@ -58,7 +58,7 @@ Cursor payloads should include both `hook_event_name` and `tool_name` (common sc
 | OpenCode | `tool.execute.before/after` | deny throws; `args` rewrite | after `output` field | OpenCode plugin (`adapters/opencode/toolgate-hook.mjs`) |
 | Pi | `tool_call` / `tool_result` | `{ block, reason }` on tool_call | `content` on tool_result | Pi `ExtensionAPI` ([extensions docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)) |
 
-Shims (spawn `toolgate hook`, zero policy): `adapters/opencode/toolgate-hook.mjs`, `adapters/pi/toolgate-hook.mjs`.
+Shims (spawn `toolgate hook`, zero policy): `adapters/opencode/toolgate-hook.mjs` → `~/.config/opencode/plugins/`, `adapters/pi/toolgate-hook.ts` → `~/.pi/agent/extensions/` (store-path binary baked in at install).
 
 ## Install
 
