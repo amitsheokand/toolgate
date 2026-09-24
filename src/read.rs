@@ -285,7 +285,13 @@ fn truncate_line_display(line: &str) -> String {
     s
 }
 
-/// Prefix each line with a 1-based line number, right-aligned, then `|`.
+/// Prefix landmark lines with a 1-based line number, right-aligned, then `|`
+/// (Cursor's measured no-quality-drop scheme): the first line of the window
+/// plus every tenth absolute line. Agents interpolate the rest.
+pub fn number_landmark(n: u64, first: u64) -> bool {
+    n == first || n % 10 == 0
+}
+
 pub fn format_numbered_lines(start: u64, lines: &[String]) -> Vec<String> {
     if lines.is_empty() {
         return Vec::new();
@@ -297,7 +303,11 @@ pub fn format_numbered_lines(start: u64, lines: &[String]) -> Vec<String> {
         .enumerate()
         .map(|(i, line)| {
             let n = start + i as u64;
-            format!("{n:>width$}|{line}", n = n, line = line, width = width)
+            if number_landmark(n, start) {
+                format!("{n:>width$}|{line}", n = n, line = line, width = width)
+            } else {
+                line.clone()
+            }
         })
         .collect()
 }
@@ -313,7 +323,11 @@ pub fn apply_char_budget(start: u64, end: u64, lines: Vec<String>) -> (u64, Vec<
     for (i, line) in lines.into_iter().enumerate() {
         let n = start + i as u64;
         let width = end.to_string().len().max(n.to_string().len());
-        let row_len = format!("{n:>width$}|{line}", n = n, line = line, width = width).len() + 1;
+        let row_len = if number_landmark(n, start) {
+            format!("{n:>width$}|{line}", n = n, line = line, width = width).len() + 1
+        } else {
+            line.len() + 1
+        };
         if kept.is_empty() || budget >= row_len {
             budget = budget.saturating_sub(row_len);
             kept.push(line);
@@ -543,7 +557,19 @@ mod tests {
     fn format_numbered_lines_aligns() {
         let lines = vec!["a".to_owned(), "b".to_owned()];
         let out = format_numbered_lines(41, &lines);
-        assert_eq!(out, vec!["41|a", "42|b"]);
+        assert_eq!(out, vec!["41|a", "b"]);
+    }
+
+    #[test]
+    fn format_numbered_lines_every_tenth() {
+        let lines: Vec<String> = (1..=25).map(|i| format!("l{i}")).collect();
+        let out = format_numbered_lines(8, &lines);
+        assert_eq!(out[0], " 8|l1");
+        assert_eq!(out[1], "l2");
+        assert_eq!(out[2], "10|l3");
+        assert_eq!(out[12], "20|l13");
+        assert_eq!(out[22], "30|l23");
+        assert_eq!(out[24], "l25");
     }
 
     #[test]

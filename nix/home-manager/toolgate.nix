@@ -53,14 +53,14 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
-      xdg.configFile."toolgate/policy.toml".text =
+      xdg.configFile."toolgate/policy.toml".source =
         let
           base = {
             mode = cfg.mode;
           };
           merged = base // cfg.policy;
         in
-        pkgs.formats.toml { } .generate "" merged;
+        (pkgs.formats.toml { }).generate "toolgate-policy.toml" merged;
 
       home.packages = [ cfg.package ];
     }
