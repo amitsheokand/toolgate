@@ -14,6 +14,7 @@ toolgate read <file> [--line N] [--radius R] [--start M --end K] [--root <dir>]
 toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]  # prints its diff
 toolgate run <program> [args...] [--root <dir>] [--timeout S]          # argv-direct
 toolgate serve  # MCP stdio server (`read`, `edit`, `run`)
+toolgate hook cursor-read  # Cursor preToolUse Read cap (stdio JSON)
 
 ## Install
 
@@ -38,7 +39,31 @@ its loaded image.
 - `--line N`: ~200-line window around N (default radius 100), clamped.
 - No `--line`: files ≤ 400 lines read whole; larger files require
   `--start/--end` (or `--line`) — the error names the count and flags.
-- Escapes, binaries, and generated files (>8k-char lines) are refused.
+- Escapes (including symlink breakout), binaries (NUL), and overlong
+  lines (truncated in read output with a marker) are handled as above.
+- Read output prefixes each line with `N|` (1-based, right-aligned).
+
+### Cursor `preToolUse` (Read)
+
+Register in `~/.cursor/hooks.json` (merge with your existing hooks):
+
+```json
+{
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "Read",
+        "command": "/home/amitsheokand/.local/bin/toolgate hook cursor-read"
+      }
+    ]
+  }
+}
+```
+
+Whole-file reads of files over 400 lines are **denied** with an
+`agent_message` naming the line count (offset/limit reads pass through).
+Set `TOOLGATE_READ_HOOK=0` to disable. The hook always exits 0 and prints
+exactly one JSON object; I/O or parse failures emit `{"permission":"allow"}`.
 
 ## Gates
 

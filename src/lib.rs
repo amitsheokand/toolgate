@@ -5,6 +5,7 @@
 
 pub mod edit;
 pub mod gate;
+pub mod hook;
 pub mod mcp;
 pub mod read;
 pub mod run;

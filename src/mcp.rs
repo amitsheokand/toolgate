@@ -128,7 +128,8 @@ impl ToolGate {
             hit.end,
             hit.total
         );
-        out.push_str(&hit.text.join("\n"));
+        let numbered = read::format_numbered_lines(hit.start, &hit.text);
+        out.push_str(&numbered.join("\n"));
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 

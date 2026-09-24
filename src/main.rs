@@ -9,6 +9,13 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// `preToolUse` hook for Cursor `Read` (caps whole-file reads).
+    #[command(name = "cursor-read")]
+    CursorRead,
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Bounded file read (windows by default, never unbounded dumps).
     Read {
@@ -53,6 +60,11 @@ enum Command {
         /// Refusals fail closed: no key, no run.
         #[arg(long)]
         gate: bool,
+    },
+    /// Cursor Agent hooks (stdio JSON).
+    Hook {
+        #[command(subcommand)]
+        hook: HookCommand,
     },
     /// Exact-string edit that returns its diff (no re-read needed).
     Edit {
@@ -107,7 +119,16 @@ async fn main() -> Result<()> {
                 hit.end,
                 hit.total
             );
-            println!("{}", hit.text.join("\n"));
+            let numbered = toolgate::read::format_numbered_lines(hit.start, &hit.text);
+            println!("{}", numbered.join("\n"));
+        }
+        Command::Hook {
+            hook: HookCommand::CursorRead,
+        } => {
+            if toolgate::hook::cursor_read_stdio().is_err() {
+                println!(r#"{{"permission":"allow"}}"#);
+            }
+            return Ok(());
         }
         Command::Serve { .. } => {
             toolgate::mcp::serve_stdio().await?;
