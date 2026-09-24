@@ -43,6 +43,9 @@ struct RunParams {
     args: Option<Vec<String>>,
     /// Wall-clock budget in seconds (default 120).
     timeout: Option<u64>,
+    /// Ask the Jev safety gate first (needs `TYPESAFE_API_KEY`).
+    /// Refusals fail closed: no key, no run.
+    gate: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -151,10 +154,35 @@ impl ToolGate {
     }
 
     #[tool(
-        description = "Bounded command execution: kills on timeout, head-truncates output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell."
+        description = "Bounded command execution: kills on timeout, head-truncates output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell. `gate` asks the Jev safety Noul first (needs TYPESAFE_API_KEY); refusals fail closed."
     )]
     async fn run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
         let root = check_root(&p.root)?;
+        if p.gate.unwrap_or(false) {
+            let gate = crate::gate::Gate::from_env().map_err(|e| {
+                McpError::internal_error(format!("safety gate unavailable: {e}"), None)
+            })?;
+            let root_str = root.to_string_lossy().into_owned();
+            let score = gate
+                .judge(&p.program, &p.args.clone().unwrap_or_default(), &root_str)
+                .await
+                .map_err(|e| McpError::internal_error(format!("safety gate failed: {e}"), None))?;
+            match crate::gate::decide(score, &crate::gate::Policy::default()) {
+                crate::gate::Verdict::Allow => {}
+                crate::gate::Verdict::Ask(reason) => {
+                    return Err(McpError::internal_error(
+                        format!("safety gate withholds run ({reason})"),
+                        None,
+                    ));
+                }
+                crate::gate::Verdict::Block(reason) => {
+                    return Err(McpError::internal_error(
+                        format!("safety gate refused run ({reason})"),
+                        None,
+                    ));
+                }
+            }
+        }
         let hit = crate::run::run(
             &root,
             &p.program,
@@ -270,6 +298,7 @@ mod tests {
                 program: "echo".into(),
                 args: Some(vec!["hi".into()]),
                 timeout: Some(10),
+                gate: None,
             }))
             .await
             .expect("run");

@@ -21,13 +21,16 @@ toolgate serve  # MCP stdio server (`read`, `edit`, `run`)
   `--start/--end` (or `--line`) — the error names the count and flags.
 - Escapes, binaries, and generated files (>8k-char lines) are refused.
 
-## Queued (in order)
+## Gates
 
-1. **Edit diffs** (advice #4): return a short diff with each edit so agents
-   stop re-reading files to check their own writes.
-2. **Shell gates** (advice #5): bounded/long-running command policy
-   (`run_gates` equivalent) — the biggest remaining re-read source after
-   reads.
+- `read`: windows by default, ranges on demand (above).
+- `edit`: exact-string replacement returning its capped diff.
+- `run`: timeout + output budget, argv-direct. `--gate` / `gate: true`
+  asks the Jev safety Noul first (`TYPESAFE_API_KEY` required):
+  allow runs, ask-band and block refuse with the score attached, and a
+  missing key refuses too (fail closed). Thresholds live in one
+  `gate::Policy` (`block_at` 0.65, `ask_at` 0.35), tested with canned
+  numbers — tune from logs, not from the hook.
 
 ## Joining the measurement
 

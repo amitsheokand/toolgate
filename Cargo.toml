@@ -17,11 +17,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.13", features = ["json"] }
 rmcp = { version = "2.2.0", features = ["server", "transport-io", "transport-streamable-http-server", "schemars"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

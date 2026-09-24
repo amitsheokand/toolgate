@@ -4,6 +4,7 @@
 //! First gate: capped file reads (see [`read`]).
 
 pub mod edit;
+pub mod gate;
 pub mod mcp;
 pub mod read;
 pub mod run;

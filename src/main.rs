@@ -45,6 +45,10 @@ enum Command {
         /// Wall-clock budget in seconds (default 120).
         #[arg(long)]
         timeout: Option<u64>,
+        /// Ask the Jev safety gate first (needs `TYPESAFE_API_KEY`).
+        /// Refusals fail closed: no key, no run.
+        #[arg(long)]
+        gate: bool,
     },
     /// Exact-string edit that returns its diff (no re-read needed).
     Edit {
@@ -109,7 +113,25 @@ async fn main() -> Result<()> {
             args,
             root,
             timeout,
+            gate,
         } => {
+            if gate {
+                let g = toolgate::gate::Gate::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let root_str = root.to_string_lossy().into_owned();
+                let score = g
+                    .judge(&program, &args, &root_str)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                match toolgate::gate::decide(score, &toolgate::gate::Policy::default()) {
+                    toolgate::gate::Verdict::Allow => {}
+                    toolgate::gate::Verdict::Ask(reason) => {
+                        anyhow::bail!("safety gate withholds run ({reason})")
+                    }
+                    toolgate::gate::Verdict::Block(reason) => {
+                        anyhow::bail!("safety gate refused run ({reason})")
+                    }
+                }
+            }
             let hit = toolgate::run::run(
                 &root,
                 &program,
