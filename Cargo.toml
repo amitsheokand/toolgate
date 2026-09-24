@@ -1,0 +1,27 @@
+[package]
+name = "toolgate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Harness-side guardrails: capped file reads (more gates to follow)"
+license = "Apache-2.0"
+
+[lib]
+name = "toolgate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "toolgate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "2.2.0", features = ["server", "transport-io", "transport-streamable-http-server", "schemars"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
