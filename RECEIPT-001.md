@@ -1,6 +1,6 @@
 # RECEIPT-001 — T-tg-policy
 
-Commit: (see latest on `T-tg-policy` after Round 2).
+Commit: `c78920f` on `T-tg-policy`.
 
 ## Adapter matrix (sources)
 
