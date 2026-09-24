@@ -19,9 +19,9 @@ Cursor docs (`preToolUse` output table) state `agent_message` is fed back **when
 ## Gate output (tail)
 
 ```
-running 40 tests
-........................................
-test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+running 45 tests
+.............................................
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 
 
 running 0 tests
@@ -65,3 +65,30 @@ running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
+
+## Review round 2
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | `metadata_nofollow` opened with `O_NOFOLLOW` then called `fs::metadata(path)` (follows symlinks) | Return `file.metadata()` from the nofollow fd. |
+| 2 | Multibyte truncate test used 2-byte `é`; cut at `MAX_LINE_CHARS` bytes already on a char boundary | Repeat 3-byte `€` so the byte cut lands mid-scalar and `is_char_boundary` walk-back is covered. |
+
+### Gate output (tail, round 2)
+
+```
+running 45 tests
+.............................................
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+(`cargo fmt --check` passed.)

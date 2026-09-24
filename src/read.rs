@@ -146,8 +146,8 @@ pub(crate) fn resolve_path(root: &Path, raw: &str) -> Result<PathBuf, Error> {
 
 /// Metadata for an existing file at a canonical path (no symlink follow on open).
 pub(crate) fn metadata_nofollow(path: &Path) -> Result<std::fs::Metadata, Error> {
-    let _ = open_nofollow(path, false)?;
-    fs::metadata(path).map_err(Error::from)
+    let file = open_nofollow(path, false)?;
+    file.metadata().map_err(Error::from)
 }
 
 /// Open `path` without following symlinks; verify fd identity matches path metadata.
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn multibyte_long_line_truncated_safely() {
-        let long = "é".repeat(MAX_LINE_CHARS);
+        let long = "€".repeat(MAX_LINE_CHARS);
         let content = format!("short\n{long}\n");
         let dir = workspace_with(&[("a.txt", content.as_str())]);
         let hit = read(dir.path(), "a.txt", None, 100, None, WHOLE_FILE_LIMIT_LINES).expect("read");
