@@ -3,7 +3,7 @@ name = "toolgate"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Harness-side guardrails: capped file reads (more gates to follow)"
+description = "Harness-side guardrails: capped file reads, exact edits with diffs, and bounded shell commands"
 license = "Apache-2.0"
 
 [lib]
