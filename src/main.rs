@@ -23,11 +23,23 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Subcommand)]
-enum HookCommand {
-    /// `preToolUse` hook for Cursor `Read` (caps whole-file reads).
-    #[command(name = "cursor-read")]
-    CursorRead,
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HarnessCli {
+    Cursor,
+    Muse,
+    Opencode,
+    Pi,
+}
+
+impl From<HarnessCli> for toolgate::event::Harness {
+    fn from(value: HarnessCli) -> Self {
+        match value {
+            HarnessCli::Cursor => Self::Cursor,
+            HarnessCli::Muse => Self::Muse,
+            HarnessCli::Opencode => Self::Opencode,
+            HarnessCli::Pi => Self::Pi,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,10 +87,17 @@ enum Command {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// Cursor Agent hooks (stdio JSON).
+    /// Harness hooks (stdio JSON in/out).
     Hook {
-        #[command(subcommand)]
-        hook: HookCommand,
+        /// Harness adapter (`cursor`, `muse`, `opencode`, `pi`).
+        #[arg(long, value_enum)]
+        harness: Option<HarnessCli>,
+        /// Hook event name (`preToolUse`, `postToolUse`, `PreToolUse`, …).
+        #[arg(long, default_value = "preToolUse")]
+        event: String,
+        /// Legacy alias for Cursor read cap (`preToolUse`).
+        #[arg(long, hide = true)]
+        cursor_read: bool,
     },
     /// Exact-string edit that returns its diff (no re-read needed).
     Edit {
@@ -137,10 +156,29 @@ async fn main() -> Result<()> {
             println!("{}", numbered.join("\n"));
         }
         Command::Hook {
-            hook: HookCommand::CursorRead,
+            harness,
+            event,
+            cursor_read,
         } => {
-            if toolgate::hook::cursor_read_stdio().is_err() {
-                println!(r#"{{"permission":"allow"}}"#);
+            let harness = if cursor_read {
+                toolgate::event::Harness::Cursor
+            } else {
+                harness
+                    .ok_or_else(|| anyhow::anyhow!("--harness is required (or use --cursor-read)"))?
+                    .into()
+            };
+            let event = if cursor_read {
+                "preToolUse".to_owned()
+            } else {
+                event
+            };
+            if toolgate::hook::hook_stdio(harness, &event).is_err() {
+                let allow = toolgate::adapters::allow_reply(harness, &event);
+                println!(
+                    "{}",
+                    serde_json::to_string(&allow)
+                        .unwrap_or_else(|_| r#"{"permission":"allow"}"#.into())
+                );
             }
             return Ok(());
         }

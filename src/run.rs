@@ -163,6 +163,15 @@ impl StreamClipper {
     }
 }
 
+/// Head+tail clip a UTF-8 string to `output_cap` bytes (same algorithm as run output).
+#[must_use]
+pub fn clip_utf8(text: &str, output_cap: usize) -> String {
+    let (head_cap, tail_cap) = head_tail_caps(output_cap);
+    let mut clipper = StreamClipper::new(head_cap, tail_cap);
+    clipper.push(text.as_bytes());
+    clipper.finish()
+}
+
 fn bytes_to_str(bytes: &[u8]) -> String {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
