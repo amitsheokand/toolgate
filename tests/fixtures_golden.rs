@@ -9,6 +9,28 @@ use toolgate::hook::{HookEnv, HookPaths, hook_stdio_with};
 use toolgate::policy::{PolicyMode, decide, load_policy_file, resolve_mode};
 use toolgate::telemetry::{append_row, row_from};
 
+fn normalize_archive_paths(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                normalize_archive_paths(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                normalize_archive_paths(v);
+            }
+        }
+        Value::String(s) => {
+            if let Some(idx) = s.find("\n\n[toolgate] full output archived at ") {
+                let head = s[..idx].to_string();
+                *s = format!("{head}\n\n[toolgate] full output archived at <archive>/<sha>.log");
+            }
+        }
+        _ => {}
+    }
+}
+
 fn fixture_dir(harness: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -25,7 +47,7 @@ fn run_case(harness: Harness, event: &str, stem: &str, home: &PathBuf, cwd: Opti
     let input_path = dir.join(format!("{stem}.in.json"));
     let golden_path = dir.join(format!("{stem}.reply.json"));
     let input = std::fs::read_to_string(&input_path).expect("read input");
-    let golden: Value =
+    let mut golden: Value =
         serde_json::from_str(&std::fs::read_to_string(&golden_path).expect("read golden"))
             .expect("golden json");
     let mut payload: Value = serde_json::from_str(&input).expect("input json");
@@ -48,21 +70,34 @@ fn run_case(harness: Harness, event: &str, stem: &str, home: &PathBuf, cwd: Opti
         &env,
     )
     .expect("hook");
-    let reply: Value =
+    let mut reply: Value =
         serde_json::from_str(String::from_utf8(out).unwrap().trim()).expect("reply json");
+    let mut golden = golden;
+    normalize_archive_paths(&mut reply);
+    normalize_archive_paths(&mut golden);
     assert_eq!(reply, golden, "{stem}");
 }
 
-#[test]
-fn cursor_read_over_limit_denies() {
+fn home_with_policy(tmp: &tempfile::TempDir) -> PathBuf {
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    home
+}
+
+fn big_file_workspace() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let body = (1..=500)
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(tmp.path().join("big.txt"), body).expect("write");
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    let home = home_with_policy(&tmp);
+    (tmp, home)
+}
+
+#[test]
+fn cursor_read_over_limit_denies() {
+    let (tmp, home) = big_file_workspace();
     run_case(
         Harness::Cursor,
         "preToolUse",
@@ -75,32 +110,28 @@ fn cursor_read_over_limit_denies() {
 #[test]
 fn cursor_bounded_read_allows() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    let home = home_with_policy(&tmp);
     run_case(Harness::Cursor, "preToolUse", "bounded_read", &home, None);
 }
 
 #[test]
 fn cursor_small_read_allows() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    let home = home_with_policy(&tmp);
     run_case(Harness::Cursor, "preToolUse", "small_read", &home, None);
 }
 
 #[test]
 fn cursor_shell_deny() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    let home = home_with_policy(&tmp);
     run_case(Harness::Cursor, "preToolUse", "shell_deny", &home, None);
 }
 
 #[test]
 fn cursor_unknown_allows() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    let home = home_with_policy(&tmp);
     run_case(
         Harness::Cursor,
         "preToolUse",
@@ -111,10 +142,115 @@ fn cursor_unknown_allows() {
 }
 
 #[test]
+fn cursor_big_shell_output_observes_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = home_with_policy(&tmp);
+    run_case(
+        Harness::Cursor,
+        "afterShellExecution",
+        "big_shell_output",
+        &home,
+        None,
+    );
+}
+
+#[test]
+fn cursor_big_mcp_output_clips() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = home_with_policy(&tmp);
+    run_case(
+        Harness::Cursor,
+        "postToolUse",
+        "big_mcp_output",
+        &home,
+        None,
+    );
+}
+
+#[test]
+fn muse_matrix() {
+    let (tmp, home) = big_file_workspace();
+    run_case(
+        Harness::Muse,
+        "PreToolUse",
+        "read_over_limit",
+        &home,
+        Some(tmp.path().to_str().unwrap()),
+    );
+    run_case(Harness::Muse, "PreToolUse", "bounded_read", &home, None);
+    run_case(Harness::Muse, "PreToolUse", "small_read", &home, None);
+    run_case(Harness::Muse, "PreToolUse", "shell_deny", &home, None);
+    run_case(Harness::Muse, "PreToolUse", "unknown_payload", &home, None);
+}
+
+#[test]
+fn opencode_matrix() {
+    let (tmp, home) = big_file_workspace();
+    run_case(
+        Harness::Opencode,
+        "tool.execute.before",
+        "read_over_limit",
+        &home,
+        Some(tmp.path().to_str().unwrap()),
+    );
+    run_case(
+        Harness::Opencode,
+        "tool.execute.before",
+        "bounded_read",
+        &home,
+        None,
+    );
+    run_case(
+        Harness::Opencode,
+        "tool.execute.before",
+        "small_read",
+        &home,
+        None,
+    );
+    run_case(
+        Harness::Opencode,
+        "tool.execute.before",
+        "shell_deny",
+        &home,
+        None,
+    );
+    run_case(
+        Harness::Opencode,
+        "tool.execute.before",
+        "unknown_payload",
+        &home,
+        None,
+    );
+    run_case(
+        Harness::Opencode,
+        "tool.execute.after",
+        "big_shell_output",
+        &home,
+        None,
+    );
+}
+
+#[test]
+fn pi_matrix() {
+    let (tmp, home) = big_file_workspace();
+    run_case(
+        Harness::Pi,
+        "tool_call",
+        "read_over_limit",
+        &home,
+        Some(tmp.path().to_str().unwrap()),
+    );
+    run_case(Harness::Pi, "tool_call", "bounded_read", &home, None);
+    run_case(Harness::Pi, "tool_call", "small_read", &home, None);
+    run_case(Harness::Pi, "tool_call", "shell_deny", &home, None);
+    run_case(Harness::Pi, "tool_call", "unknown_payload", &home, None);
+    run_case(Harness::Pi, "tool_result", "big_shell_output", &home, None);
+}
+
+#[test]
 fn observe_mode_logs_but_allows() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path().join("home");
-    std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+    let home = home_with_policy(&tmp);
     let policy_path = home.join(".config/toolgate/policy.toml");
     std::fs::write(&policy_path, "mode = \"observe\"\n").expect("policy");
     let mut policy = load_policy_file(&policy_path);

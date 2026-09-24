@@ -1,7 +1,8 @@
 //! OpenCode plugin hook (`tool.execute.before` / `tool.execute.after`).
 //!
 //! OpenCode plugins receive `{ tool, input, sessionId, cwd }` on stdin; replies
-//! may set `{ allow: false, message }` or `{ output: string }` on after hooks.
+//! The plugin shim maps hook stdout to `output.args` (before) or `output.output` (after).
+//! Deny is signaled with `{ "deny": true, "message": "..." }` (shim throws).
 
 use serde_json::{Value, json};
 
@@ -71,15 +72,12 @@ pub fn parse(event_name: &str, value: &Value) -> ToolEvent {
 
 pub fn render(_event_name: &str, outcome: &PolicyOutcome) -> Value {
     match &outcome.applied {
-        Decision::Allow => json!({ "allow": true }),
+        Decision::Allow => json!({}),
         Decision::Deny { agent_message, .. } => json!({
-            "allow": false,
+            "deny": true,
             "message": agent_message
         }),
-        Decision::Rewrite { updated_input, .. } => json!({
-            "allow": true,
-            "input": updated_input
-        }),
+        Decision::Rewrite { updated_input, .. } => json!({ "args": updated_input }),
         Decision::ReplaceOutput { text, .. } => json!({ "output": text }),
     }
 }

@@ -1,0 +1,1 @@
+{"tool":"bash","input":{"command":"rm -rf /tmp/x"},"sessionId":"s","cwd":"/tmp/ws"}

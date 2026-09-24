@@ -166,6 +166,11 @@ pub fn resolve_mode(file: &Policy, env_override: Option<&str>) -> PolicyMode {
 /// Pure policy evaluation (no I/O except optional archive write via `archive_dir`).
 #[must_use]
 pub fn decide(event: &ToolEvent, policy: &Policy, archive_dir: Option<&Path>) -> PolicyOutcome {
+    let archive_dir = if policy.mode == PolicyMode::Observe {
+        None
+    } else {
+        archive_dir
+    };
     let raw = decide_inner(event, policy, archive_dir);
     let rule_id = rule_id_of(&raw);
     let applied = if policy.mode == PolicyMode::Observe {
@@ -212,11 +217,19 @@ fn decide_post(event: &ToolEvent, policy: &Policy, archive_dir: Option<&Path>) -
         return Decision::Allow;
     }
     match &event.tool {
-        ToolKind::Shell | ToolKind::Mcp { .. } => {
+        ToolKind::Mcp { .. } => clip_output_decision(output, policy.clip.min_bytes, archive_dir),
+        ToolKind::Shell if shell_post_clip_enabled(event.harness) => {
             clip_output_decision(output, policy.clip.min_bytes, archive_dir)
         }
         _ => Decision::Allow,
     }
+}
+
+fn shell_post_clip_enabled(harness: crate::event::Harness) -> bool {
+    matches!(
+        harness,
+        crate::event::Harness::Opencode | crate::event::Harness::Pi
+    )
 }
 
 fn read_pre(event: &ToolEvent, policy: &Policy) -> Decision {
@@ -398,6 +411,31 @@ mod tests {
     }
 
     #[test]
+    fn observe_mode_skips_archive_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = "x".repeat(5000);
+        let mut policy = Policy::default();
+        policy.mode = PolicyMode::Observe;
+        let event = ToolEvent {
+            output: Some(big),
+            harness: Harness::Opencode,
+            phase: Phase::Post,
+            tool: ToolKind::Shell,
+            args: NormalizedArgs::default(),
+            session_id: "s".into(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+        };
+        let archive = dir.path().join("archive");
+        let out = decide(&event, &policy, Some(&archive));
+        assert!(matches!(out.raw, Decision::ReplaceOutput { .. }));
+        assert_eq!(out.applied, Decision::Allow);
+        assert!(
+            !archive.exists() || std::fs::read_dir(&archive).is_ok_and(|mut d| d.next().is_none()),
+            "observe must not archive"
+        );
+    }
+
+    #[test]
     fn observe_mode_masks_decision() {
         let dir = tempfile::tempdir().expect("tempdir");
         let big = "x".repeat(5000);
@@ -405,7 +443,7 @@ mod tests {
         policy.mode = PolicyMode::Observe;
         let event = ToolEvent {
             output: Some(big),
-            harness: Harness::Cursor,
+            harness: Harness::Opencode,
             phase: Phase::Post,
             tool: ToolKind::Shell,
             args: NormalizedArgs::default(),

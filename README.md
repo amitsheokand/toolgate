@@ -35,10 +35,10 @@ Legacy: `toolgate hook --cursor-read` → Cursor `preToolUse`.
 
 | Harness | Hook events | Deny / rewrite (pre) | Replace output (post) | Source |
 | --- | --- | --- | --- | --- |
-| Cursor | `preToolUse`, `postToolUse`, `afterShellExecution`, `afterMCPExecution` | preToolUse | postToolUse MCP only; shell post via `additional_context` | [Cursor hooks](https://cursor.com/docs/agent/hooks) |
-| Muse | `PreToolUse`, `PostToolUse` | same as Cursor | same | Muse settings (Claude Code–compatible JSON) |
-| OpenCode | `tool.execute.before/after` | before | after `output` field | OpenCode plugin API |
-| Pi | `tool_call` / `tool_result` | cancel + message | `content` text replace | Pi `ExtensionAPI` events (`epr.ts`) |
+| Cursor | `preToolUse`, `postToolUse`, `afterShellExecution`, `afterMCPExecution` | preToolUse | postToolUse MCP only (`updated_mcp_tool_output`); shell/MCP after-hooks telemetry only | [Cursor hooks](https://cursor.com/docs/agent/hooks) |
+| Muse | `PreToolUse`, `PostToolUse` | `hookSpecificOutput` on PreToolUse | PostToolUse MCP (Cursor-shaped) | Muse settings (Claude Code–compatible JSON) |
+| OpenCode | `tool.execute.before/after` | deny throws; `args` rewrite | after `output` field | OpenCode plugin (`adapters/opencode/toolgate-hook.mjs`) |
+| Pi | `tool_call` / `tool_result` | `{ block, reason }` on tool_call | `content` on tool_result | Pi `ExtensionAPI` ([extensions docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)) |
 
 Shims (spawn `toolgate hook`, zero policy): `adapters/opencode/toolgate-hook.mjs`, `adapters/pi/toolgate-hook.mjs`.
 

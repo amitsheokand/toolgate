@@ -19,8 +19,25 @@ let
     else
       echo '{}' > "$tmp"
     fi
+    merge_jq='
+      def command_key(e):
+        if (e | type) != "object" then null
+        elif e.command? then e.command
+        elif e.hooks? and (e.hooks | length) > 0 then e.hooks[0].command
+        else null end;
+      def merge_lists($base; $patch):
+        ($base // []) as $b | ($patch // []) as $p |
+        ($p | map(command_key(.))) as $keys |
+        ($b | map(select(command_key(.) as $k | $keys | index($k) == null))) + $p;
+      def merge_hooks($base; $patch):
+        ($base.hooks // {}) as $bh | ($patch.hooks // {}) as $ph |
+        reduce (($bh | keys) + ($ph | keys) | unique | .[]) as $k
+          ({}; . + { ($k): merge_lists($bh[$k]; $ph[$k]) }) as $merged |
+        $base * $patch | .hooks = $merged;
+      merge_hooks(.[0]; .[1])
+    '
     for patch in "$@"; do
-      ${pkgs.jq}/bin/jq -s '.[0] * .[1]' "$tmp" "$patch" > "$tmp.new"
+      ${pkgs.jq}/bin/jq -s "$merge_jq" "$tmp" "$patch" > "$tmp.new"
       mv "$tmp.new" "$tmp"
     done
     mkdir -p "$(dirname "$target")"
@@ -71,7 +88,7 @@ in
 
     home.packages = [ cfg.package ];
 
-    xdg.configFile."opencode/toolgate-hook.mjs".source =
+    xdg.configFile."opencode/plugins/toolgate-hook.mjs".source =
       ../../adapters/opencode/toolgate-hook.mjs;
 
     xdg.configFile."pi/extensions/toolgate-hook.mjs".source =
@@ -89,7 +106,6 @@ in
           ];
           postToolUse = [
             {
-              matcher = "MCP:*";
               command = "${toolgateBin} hook --harness cursor --event postToolUse";
             }
           ];
@@ -109,14 +125,23 @@ in
         hooks = {
           PreToolUse = [
             {
-              matcher = "Read|Shell|Grep|Glob";
-              command = "${toolgateBin} hook --harness muse --event PreToolUse";
+              matcher = "Read|Shell|Grep|Glob|Bash";
+              hooks = [
+                {
+                  type = "command";
+                  command = "${toolgateBin} hook --harness muse --event PreToolUse";
+                }
+              ];
             }
           ];
           PostToolUse = [
             {
-              matcher = "MCP:*";
-              command = "${toolgateBin} hook --harness muse --event PostToolUse";
+              hooks = [
+                {
+                  type = "command";
+                  command = "${toolgateBin} hook --harness muse --event PostToolUse";
+                }
+              ];
             }
           ];
         };

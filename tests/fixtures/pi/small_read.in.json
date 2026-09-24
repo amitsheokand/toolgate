@@ -1,0 +1,8 @@
+{
+  "toolName": "read",
+  "input": {
+    "path": "tiny.txt"
+  },
+  "sessionId": "s",
+  "cwd": "/tmp/ws"
+}

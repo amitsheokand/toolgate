@@ -3,7 +3,7 @@
 //! Schema: <https://cursor.com/docs/agent/hooks>
 //! - `preToolUse`: deny / rewrite via `permission` + `updated_input`
 //! - `postToolUse`: MCP output replace via `updated_mcp_tool_output` only
-//! - `afterShellExecution` / `afterMCPExecution`: clip via `additional_context` (observe-friendly)
+//! - `afterShellExecution` / `afterMCPExecution`: telemetry only (no model output change)
 
 use serde_json::{Map, Value, json};
 
@@ -31,12 +31,10 @@ pub fn parse(event_name: &str, value: &Value) -> ToolEvent {
     } else {
         Phase::Pre
     };
-    let tool_name = value
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("hook_event_name").and_then(Value::as_str))
-        .unwrap_or("");
-    let tool = map_tool_name(tool_name, value);
+    let hook_event = value.get("hook_event_name").and_then(Value::as_str);
+    let tool_name = value.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    let classify = hook_event.unwrap_or(tool_name);
+    let tool = map_tool_name(classify, value);
     let cwd = value
         .get("cwd")
         .and_then(Value::as_str)
@@ -91,7 +89,7 @@ fn map_tool_name(name: &str, value: &Value) -> ToolKind {
         "Read" | "beforeReadFile" => ToolKind::Read,
         "Write" | "afterFileEdit" => ToolKind::Write,
         "Edit" => ToolKind::Edit,
-        "Shell" | "beforeShellExecution" | "afterShellExecution" => ToolKind::Shell,
+        "Shell" | "Bash" | "beforeShellExecution" | "afterShellExecution" => ToolKind::Shell,
         "Grep" => ToolKind::Grep,
         "Glob" => ToolKind::Glob,
         other if other.starts_with("MCP:") => {
@@ -198,9 +196,52 @@ fn post_replace(event_name: &str, text: &str) -> Value {
         "postToolUse" => json!({
             "updated_mcp_tool_output": { "content": [{ "type": "text", "text": text }] }
         }),
-        "afterShellExecution" | "afterMCPExecution" => json!({
-            "additional_context": text
-        }),
-        _ => json!({ "additional_context": text }),
+        "afterShellExecution" | "afterMCPExecution" => json!({}),
+        _ => json!({}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Decision, PolicyOutcome};
+
+    #[test]
+    fn after_mcp_execution_classifies_as_mcp() {
+        let payload = json!({
+            "hook_event_name": "afterMCPExecution",
+            "tool_name": "search_ranked",
+            "mcp_server_name": "one-grep",
+            "result_json": "x".repeat(5000)
+        });
+        let ev = parse("afterMCPExecution", &payload);
+        assert!(matches!(ev.tool, ToolKind::Mcp { .. }));
+    }
+
+    #[test]
+    fn after_shell_clip_does_not_replace_output() {
+        let outcome = PolicyOutcome {
+            raw: Decision::ReplaceOutput {
+                text: "clipped".into(),
+                rule_id: "clip.output".into(),
+            },
+            applied: Decision::ReplaceOutput {
+                text: "clipped".into(),
+                rule_id: "clip.output".into(),
+            },
+            rule_id: Some("clip.output".into()),
+        };
+        let reply = render("afterShellExecution", &outcome);
+        assert_eq!(reply, json!({}));
+    }
+
+    #[test]
+    fn muse_bash_maps_to_shell() {
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "rm -rf /tmp/x" }
+        });
+        let ev = parse("preToolUse", &payload);
+        assert_eq!(ev.tool, ToolKind::Shell);
     }
 }

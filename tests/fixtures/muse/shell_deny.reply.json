@@ -1,0 +1,6 @@
+{
+  "hookSpecificOutput": {
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "denylist: rm recursive+force"
+  }
+}

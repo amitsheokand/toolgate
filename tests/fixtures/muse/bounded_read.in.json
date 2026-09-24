@@ -1,0 +1,9 @@
+{
+  "tool_name": "Read",
+  "tool_input": {
+    "path": "big.txt",
+    "offset": 10,
+    "limit": 50
+  },
+  "cwd": "/tmp/ws"
+}
