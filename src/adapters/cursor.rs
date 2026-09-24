@@ -108,14 +108,6 @@ fn mcp_kind(value: &Value, tool: &str) -> ToolKind {
 }
 
 fn map_tool_name(name: &str, value: &Value) -> ToolKind {
-    if value.get("mcp_server_name").is_some()
-        && !matches!(
-            name,
-            "beforeMCPExecution" | "afterMCPExecution" | "afterShellExecution"
-        )
-    {
-        return mcp_kind(value, name);
-    }
     match name {
         "Read" | "beforeReadFile" => ToolKind::Read,
         "Write" | "afterFileEdit" => ToolKind::Write,
@@ -277,11 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn post_mcp_uses_tool_name_when_server_present() {
+    fn post_tool_use_mcp_from_mcp_prefix_not_server_field() {
         let payload = json!({
             "hook_event_name": "postToolUse",
-            "tool_name": "search",
-            "mcp_server_name": "one-grep",
+            "tool_name": "MCP:search",
             "tool_output": "x".repeat(5000),
             "cwd": "/tmp"
         });
@@ -291,7 +282,18 @@ mod tests {
             ToolKind::Mcp {
                 server,
                 tool
-            } if server == "one-grep" && tool == "search"
+            } if server == "mcp" && tool == "search"
         ));
+    }
+
+    #[test]
+    fn post_tool_use_bare_tool_name_is_not_mcp() {
+        let payload = json!({
+            "hook_event_name": "postToolUse",
+            "tool_name": "search",
+            "tool_output": "x".repeat(5000),
+        });
+        let ev = parse("postToolUse", &payload);
+        assert!(matches!(ev.tool, ToolKind::Other(_)));
     }
 }
