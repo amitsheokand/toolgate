@@ -69,12 +69,12 @@ exactly one JSON object; I/O or parse failures emit `{"permission":"allow"}`.
 
 - `read`: windows by default, ranges on demand (above).
 - `edit`: exact-string replacement returning its capped diff.
-- `run`: timeout + output budget, argv-direct. `--gate` / `gate: true`
-  asks the Jev safety Noul first (`TYPESAFE_API_KEY` required):
-  allow runs, ask-band and block refuse with the score attached, and a
-  missing key refuses too (fail closed). Thresholds live in one
-  `gate::Policy` (`block_at` 0.65, `ask_at` 0.35), tested with canned
-  numbers — tune from logs, not from the hook.
+- `run`: timeout + head/tail output clip (8 KiB per stream, 2 KiB head /
+  6 KiB tail), process-group kill on timeout (output kept). argv-direct.
+  `toolgate serve --gate jev` (or `TOOLGATE_GATE=jev`) applies deterministic
+  allow/deny prefixes first, then Jev for the rest (`TYPESAFE_API_KEY`
+  required; missing key refuses). Thresholds in `gate::Policy` (`block_at`
+  0.65, `ask_at` 0.35) are uncalibrated — tune from logs.
 
 ## Joining the measurement
 

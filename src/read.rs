@@ -84,29 +84,72 @@ pub struct ReadHit {
     pub text: Vec<String>,
 }
 
-/// Lexically normalize `raw` against `root` (no symlink follow).
-fn resolve_lexical(root: &Path, raw: &str) -> Result<PathBuf, Error> {
-    let joined = if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
+fn path_under_canonical_root(path: &Path, canon_root: &Path) -> bool {
+    path.starts_with(canon_root)
+}
+
+/// Join `value` to `root`, walking one component at a time: canonicalize each
+/// existing prefix (symlinks resolved) before the next step; `..` applies to
+/// the resolved directory. Non-existent suffixes are lexical only (no `..`).
+#[must_use]
+pub fn inside_root(root: impl AsRef<Path>, value: &str) -> Option<PathBuf> {
+    let root = root.as_ref();
+    let canon_root = root.canonicalize().ok()?;
+    let value_path = Path::new(value);
+
+    let components: Vec<std::path::Component<'_>> = if value_path.is_absolute() {
+        if !value_path.starts_with(root) {
+            return None;
+        }
+        value_path.strip_prefix(root).ok()?.components().collect()
     } else {
-        root.join(raw)
+        value_path.components().collect()
     };
-    let mut normal = PathBuf::new();
-    for component in joined.components() {
+
+    let mut current = canon_root.clone();
+    let mut lexical_tail = false;
+
+    for component in components {
         match component {
-            std::path::Component::Prefix(prefix) => normal.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normal.push(component.as_os_str()),
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {}
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                normal.pop();
+                if lexical_tail {
+                    return None;
+                }
+                if !current.pop() {
+                    return None;
+                }
+                if !path_under_canonical_root(&current, &canon_root) {
+                    return None;
+                }
+                if current.exists() {
+                    current = current.canonicalize().ok()?;
+                    if !path_under_canonical_root(&current, &canon_root) {
+                        return None;
+                    }
+                    lexical_tail = false;
+                }
             }
-            std::path::Component::Normal(part) => normal.push(part),
+            std::path::Component::Normal(part) => {
+                current.push(part);
+                if current.exists() {
+                    current = current.canonicalize().ok()?;
+                    if !path_under_canonical_root(&current, &canon_root) {
+                        return None;
+                    }
+                    lexical_tail = false;
+                } else {
+                    lexical_tail = true;
+                }
+            }
         }
     }
-    if normal.starts_with(root) {
-        Ok(normal)
+
+    if path_under_canonical_root(&current, &canon_root) {
+        Some(current)
     } else {
-        Err(Error::Escape(raw.to_owned()))
+        None
     }
 }
 
@@ -114,34 +157,7 @@ fn resolve_lexical(root: &Path, raw: &str) -> Result<PathBuf, Error> {
 ///
 /// Returns the **canonical** path used for all later I/O.
 pub(crate) fn resolve_path(root: &Path, raw: &str) -> Result<PathBuf, Error> {
-    let path = resolve_lexical(root, raw)?;
-    let canonical_root = fs::canonicalize(root)?;
-    let canonical_target = if path.exists() {
-        fs::canonicalize(&path)?
-    } else {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let canonical_parent = if parent.exists() {
-            fs::canonicalize(parent)?
-        } else {
-            let parent_lex = resolve_lexical(root, parent.to_string_lossy().as_ref())?;
-            fs::canonicalize(&parent_lex)?
-        };
-        let name = path.file_name().ok_or_else(|| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path has no file name",
-            ))
-        })?;
-        canonical_parent.join(name)
-    };
-    if canonical_target.starts_with(&canonical_root) {
-        Ok(canonical_target)
-    } else {
-        Err(Error::Escape(raw.to_owned()))
-    }
+    inside_root(root, raw).ok_or_else(|| Error::Escape(raw.to_owned()))
 }
 
 /// Metadata for an existing file at a canonical path (no symlink follow on open).
@@ -597,6 +613,26 @@ mod tests {
         )
         .expect("read through symlink root");
         assert_eq!(hit.text, vec!["hi"]);
+    }
+
+    #[test]
+    fn inside_root_rejects_lexical_escape() {
+        let dir = workspace_with(&[("a.txt", "hi\n")]);
+        assert!(inside_root(dir.path(), "../escape").is_none());
+        assert!(inside_root(dir.path(), "sub/../../outside").is_none());
+        assert!(inside_root(dir.path(), "a.txt").is_some());
+    }
+
+    #[test]
+    fn inside_root_rejects_symlink_component_walk() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let root = root_dir.path();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir(root.join("a")).expect("mkdir a");
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).expect("symlink");
+        for value in ["link/nested", "link/../out", "link/../../x", "a/../link/x"] {
+            assert!(inside_root(root, value).is_none(), "{value}");
+        }
     }
 
     #[test]

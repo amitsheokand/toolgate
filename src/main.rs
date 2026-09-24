@@ -1,5 +1,20 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GateCli {
+    Off,
+    Jev,
+}
+
+impl From<GateCli> for toolgate::gate::GateMode {
+    fn from(value: GateCli) -> Self {
+        match value {
+            GateCli::Off => Self::Off,
+            GateCli::Jev => Self::Jev,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "toolgate", version, about = "Harness-side guardrails")]
@@ -42,6 +57,9 @@ enum Command {
         /// Use stdio transport (the only transport; kept for uniformity).
         #[arg(long)]
         stdio: bool,
+        /// Safety gate for `run`: `off` (default) or `jev` (also `TOOLGATE_GATE`).
+        #[arg(long, value_enum, default_value = "off")]
+        gate: GateCli,
     },
     /// Bounded command execution (timeout + output budget).
     Run {
@@ -56,10 +74,6 @@ enum Command {
         /// Wall-clock budget in seconds (default 120).
         #[arg(long)]
         timeout: Option<u64>,
-        /// Ask the Jev safety gate first (needs `TYPESAFE_API_KEY`).
-        /// Refusals fail closed: no key, no run.
-        #[arg(long)]
-        gate: bool,
     },
     /// Cursor Agent hooks (stdio JSON).
     Hook {
@@ -130,33 +144,16 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Command::Serve { .. } => {
-            toolgate::mcp::serve_stdio().await?;
+        Command::Serve { gate, .. } => {
+            let mode = toolgate::gate::GateMode::from_env_or(gate.into());
+            toolgate::mcp::serve_stdio(mode).await?;
         }
         Command::Run {
             program,
             args,
             root,
             timeout,
-            gate,
         } => {
-            if gate {
-                let g = toolgate::gate::Gate::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
-                let root_str = root.to_string_lossy().into_owned();
-                let score = g
-                    .judge(&program, &args, &root_str)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                match toolgate::gate::decide(score, &toolgate::gate::Policy::default()) {
-                    toolgate::gate::Verdict::Allow => {}
-                    toolgate::gate::Verdict::Ask(reason) => {
-                        anyhow::bail!("safety gate withholds run ({reason})")
-                    }
-                    toolgate::gate::Verdict::Block(reason) => {
-                        anyhow::bail!("safety gate refused run ({reason})")
-                    }
-                }
-            }
             let hit = toolgate::run::run(
                 &root,
                 &program,
