@@ -55,3 +55,24 @@ toolgate v0.1.0
 |---|---------|-----|
 | 1 | Head/tail clip left incomplete UTF-8 at buffer ends (`char_boundary_at_or_before` no-op when `pos >= len`) | Trim continuation bytes and shrink until `from_utf8` succeeds; test 2/3/4-byte scalars with exact elided byte arithmetic and no U+FFFD |
 | 2 | `rules_verdict` ignored `Rules`; git deny looked at argv[1] only | Apply custom deny/allow prefixes (cargo/git/rg allow still uses guarded `allow_verdict`); skip git global options before push/reset deny; tests for `git -C … push --force`, `--no-pager push -f`, custom lists |
+
+## Review round 3 (Grok NO-GO)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | Tail clip could panic when the tail window started on a UTF-8 continuation byte | Replaced boundary helpers with total `snap_start` / `snap_end`; property test over caps 0..=64 and scalar-mix splits (no panic, no U+FFFD, byte balance) |
+| 2 | Allow could bypass deny; git globals incomplete | Fixed pipeline: `hard_deny` (built-ins + `Rules.deny`, git deny skips unknown globals) then `hard_allow`; unknown git globals fail closed on allow; expanded `git push` force detection; table-driven deny tests and `Rules.allow=["git"]` still blocks `git push -f` |
+
+## Gate output (tail)
+
+```
+running 40 tests
+........................................
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+running 33 tests
+.................................
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+```
+
+(`cargo fmt --check` clean.)

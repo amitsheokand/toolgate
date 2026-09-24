@@ -147,15 +147,17 @@ impl StreamClipper {
             combined.extend_from_slice(&tail_bytes);
             return bytes_to_str(&combined);
         }
-        let head_end = char_boundary_at_or_before(&self.head, self.head_cap);
+        let head_limit = self.head_cap.min(self.head.len());
+        let head_end = snap_end(&self.head[..head_limit]);
         let head_kept = head_end;
-        let tail_start =
-            char_boundary_at_or_after(&tail_bytes, tail_bytes.len().saturating_sub(self.tail_cap));
-        let tail_end = char_boundary_at_or_before(&tail_bytes, tail_bytes.len());
-        let tail_kept = tail_end.saturating_sub(tail_start);
+        let take = self.tail_cap.min(tail_bytes.len());
+        let tail_window = &tail_bytes[tail_bytes.len() - take..];
+        let tail_start = snap_start(tail_window);
+        let tail_end = snap_end(tail_window).max(tail_start);
+        let tail_kept = tail_end - tail_start;
         let elided = self.total - head_kept - tail_kept;
         let head_s = bytes_to_str(&self.head[..head_end]);
-        let tail_s = bytes_to_str(&tail_bytes[tail_start..tail_end]);
+        let tail_s = bytes_to_str(&tail_window[tail_start..tail_end]);
         format!("{head_s}... [{elided} bytes elided] ...{tail_s}")
     }
 }
@@ -163,29 +165,35 @@ impl StreamClipper {
 fn bytes_to_str(bytes: &[u8]) -> String {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
-        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+        .expect("snap_start/snap_end yield valid UTF-8")
 }
 
-fn char_boundary_at_or_before(bytes: &[u8], pos: usize) -> usize {
-    let mut end = pos.min(bytes.len());
-    while end > 0 && is_utf8_continuation(bytes[end - 1]) {
-        end -= 1;
+/// Skip up to three leading UTF-8 continuation bytes (never panics).
+fn snap_start(bytes: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i < bytes.len() && i < 3 && is_utf8_continuation(bytes[i]) {
+        i += 1;
     }
-    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
-        end -= 1;
-        while end > 0 && is_utf8_continuation(bytes[end - 1]) {
-            end -= 1;
+    i
+}
+
+/// Length of a valid UTF-8 prefix; drops at most three trailing bytes (never panics).
+fn snap_end(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return bytes.len();
+    }
+    let len = bytes.len();
+    let max_trim = 3.min(len);
+    for trim in 1..=max_trim {
+        let end = len - trim;
+        if std::str::from_utf8(&bytes[..end]).is_ok() {
+            return end;
         }
     }
-    end
-}
-
-fn char_boundary_at_or_after(bytes: &[u8], pos: usize) -> usize {
-    let mut start = pos.min(bytes.len());
-    while start < bytes.len() && is_utf8_continuation(bytes[start]) {
-        start += 1;
-    }
-    start
+    0
 }
 
 fn is_utf8_continuation(b: u8) -> bool {
@@ -566,5 +574,59 @@ mod tests {
         assert_clip_no_fffd_and_elided(3, 4, "aa", 'α', b"bbbbbbbbbb", "cc");
         assert_clip_no_fffd_and_elided(3, 4, "aa", '中', b"bbbbbbbbbb", "cc");
         assert_clip_no_fffd_and_elided(3, 4, "aa", '🎉', b"bbbbbbbbbb", "cc");
+    }
+
+    fn clip_parts(out: &str) -> (usize, usize, usize) {
+        if !out.contains("bytes elided") {
+            let kept = out.as_bytes().len();
+            return (kept, 0, 0);
+        }
+        let (head_part, tail_and_mid) = out.split_once("... [").expect("split head");
+        let (mid, tail_part) = tail_and_mid.split_once("] ...").expect("split tail");
+        let elided = mid
+            .strip_suffix(" bytes elided")
+            .expect("elided suffix")
+            .parse()
+            .expect("elided number");
+        (
+            head_part.as_bytes().len(),
+            tail_part.as_bytes().len(),
+            elided,
+        )
+    }
+
+    #[test]
+    fn clipper_property_caps_and_scalar_splits() {
+        const SCALARS: &[char] = &['a', 'α', '中', '🎉', 'z'];
+        let mut seq = String::new();
+        for _ in 0..6 {
+            for ch in SCALARS {
+                seq.push(*ch);
+            }
+        }
+        for split in 0..=seq.len() {
+            let body = format!(
+                "{}{}",
+                seq.get(..split).unwrap_or(""),
+                seq.get(split..).unwrap_or("")
+            );
+            let total = body.as_bytes().len();
+            for cap in 0..=64 {
+                let (head_cap, tail_cap) = head_tail_caps(cap);
+                let mut c = StreamClipper::new(head_cap, tail_cap);
+                c.push(body.as_bytes());
+                let out = c.finish();
+                assert!(
+                    !out.contains('\u{FFFD}'),
+                    "cap={cap} split={split} body_len={total}: {out:?}"
+                );
+                let (head_kept, tail_kept, elided) = clip_parts(&out);
+                assert_eq!(
+                    head_kept + tail_kept + elided,
+                    total,
+                    "cap={cap} split={split}"
+                );
+            }
+        }
     }
 }
