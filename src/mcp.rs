@@ -140,7 +140,7 @@ impl ToolGate {
         let argv: Vec<String> = std::iter::once(program.to_owned())
             .chain(args.iter().cloned())
             .collect();
-        if let Some(v) = gate::rules_verdict(&argv, &self.state.rules) {
+        if let Some(v) = gate::rules_verdict(&argv, &self.state.rules, root) {
             return Self::verdict_to_mcp(v);
         }
         let cache_key = gate::GateCacheKey {

@@ -63,16 +63,26 @@ toolgate v0.1.0
 | 1 | Tail clip could panic when the tail window started on a UTF-8 continuation byte | Replaced boundary helpers with total `snap_start` / `snap_end`; property test over caps 0..=64 and scalar-mix splits (no panic, no U+FFFD, byte balance) |
 | 2 | Allow could bypass deny; git globals incomplete | Fixed pipeline: `hard_deny` (built-ins + `Rules.deny`, git deny skips unknown globals) then `hard_allow`; unknown git globals fail closed on allow; expanded `git push` force detection; table-driven deny tests and `Rules.allow=["git"]` still blocks `git push -f` |
 
+## Review round 4 (Grok NO-GO)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | Tail clip dropped the whole tail when the window started on a UTF-8 continuation | `snap_end` on `tail_window[tail_start..]`; property test checks head/tail byte slices match input |
+| 2 | Closed `AllowSchema` replaces prefix auto-allow; `rules_verdict` takes `root` for path flags | Linear argv parser; deny on normalized git argv; table + fuzz tests |
+| 3 | `-pp` short cluster advanced past `push`; bare `-` looped | One argv per cluster step; bare `-` is unknown and advances |
+| 4 | `Rules.deny` on raw argv; unsafe git/cargo flags allowed | Deny uses normalized git tokens; block `--output`/`--textconv`/`--ext-diff`; cargo paths outside root fail closed |
+| 5 | `rg --pre` handling | `--pre`/`--pre-glob` not in schema (Jev); safe `rg` still Allow |
+
 ## Gate output (tail)
 
 ```
+running 47 tests
+...............................................
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+
 running 40 tests
 ........................................
-test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
-
-running 33 tests
-.................................
-test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
 ```
 
 (`cargo fmt --check` clean.)

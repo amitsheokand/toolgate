@@ -108,12 +108,189 @@ fn program_basename(program: &str) -> &str {
     program.rsplit(['/', '\\']).next().unwrap_or(program)
 }
 
-fn subcommand(args: &[String]) -> Option<&str> {
-    args.first().map(String::as_str)
-}
-
 fn arg_is(value: &str, name: &str) -> bool {
     value == name || value.starts_with(&format!("{name}="))
+}
+
+fn long_flag_name(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("--")
+        .map(|s| s.split_once('=').map_or(s, |(k, _)| k))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagArity {
+    Flag,
+    TakesValue,
+    EqOrValue,
+}
+
+struct FlagDef {
+    long: &'static str,
+    short: Option<char>,
+    arity: FlagArity,
+    path_value: bool,
+}
+
+const GIT_GLOBAL_FLAGS: &[FlagDef] = &[
+    FlagDef {
+        long: "git-dir",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "work-tree",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "namespace",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "exec-path",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "config-env",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "config",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "paginate",
+        short: Some('p'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "no-pager",
+        short: Some('P'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "bare",
+        short: None,
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "no-replace-objects",
+        short: None,
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "literal-pathspecs",
+        short: None,
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+];
+
+fn git_short_cluster_known(rest: &str) -> bool {
+    !rest.is_empty() && rest.chars().all(|c| matches!(c, 'C' | 'c' | 'P' | 'p'))
+}
+
+/// One argv per step (two when `-C`/`-c` in a short cluster needs a value).
+fn advance_git_global(args: &[String], i: &mut usize) -> bool {
+    if *i >= args.len() {
+        return false;
+    }
+    let a = &args[*i];
+    if a == "-" {
+        *i += 1;
+        return true;
+    }
+    if a == "-C" || a == "-c" {
+        *i += 1;
+        if *i < args.len() {
+            *i += 1;
+        }
+        return false;
+    }
+    if a.starts_with("-C") && a.len() > 2 {
+        *i += 1;
+        return false;
+    }
+    if a.starts_with("-c") && a.len() > 2 && a != "-c" {
+        *i += 1;
+        return false;
+    }
+    if let Some(name) = long_flag_name(a) {
+        if GIT_GLOBAL_FLAGS.iter().any(|f| f.long == name) {
+            let takes = GIT_GLOBAL_FLAGS
+                .iter()
+                .find(|f| f.long == name)
+                .map(|f| f.arity != FlagArity::Flag)
+                .unwrap_or(false);
+            *i += 1;
+            if takes && !a.contains('=') && *i < args.len() {
+                *i += 1;
+            }
+            return false;
+        }
+        *i += 1;
+        return true;
+    }
+    if a.starts_with('-') && !a.starts_with("--") {
+        let rest = &a[1..];
+        if rest.is_empty() {
+            *i += 1;
+            return true;
+        }
+        if git_short_cluster_known(rest) {
+            let needs_val = rest.contains('C') || rest.contains('c');
+            *i += 1;
+            if needs_val && *i < args.len() {
+                *i += 1;
+            }
+            return false;
+        }
+        *i += 1;
+        return true;
+    }
+    false
+}
+
+fn normalized_argv(argv: &[String]) -> Vec<String> {
+    if argv.is_empty() {
+        return Vec::new();
+    }
+    let prog = program_basename(&argv[0]);
+    if prog != "git" {
+        return argv.to_vec();
+    }
+    let args = &argv[1..];
+    let mut i = 0;
+    while i < args.len() {
+        if !args[i].starts_with('-') {
+            break;
+        }
+        let before = i;
+        if advance_git_global(args, &mut i) {
+            break;
+        }
+        if i == before {
+            break;
+        }
+    }
+    let mut out = vec![argv[0].clone()];
+    out.extend(args[i..].iter().cloned());
+    out
 }
 
 fn expand_short_flags(args: &[String]) -> Vec<char> {
@@ -142,214 +319,15 @@ fn has_rm_recursive_force(args: &[String]) -> bool {
     (short_r || long_r) && (short_f || long_f)
 }
 
-fn has_git_config_injection(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        arg_is(a, "-c")
-            || a.starts_with("-c")
-            || arg_is(a, "--config")
-            || arg_is(a, "--config-env")
-            || arg_is(a, "--exec-path")
-    })
+fn subcommand_at(args: &[String], i: usize) -> Option<&str> {
+    args.get(i).map(String::as_str)
 }
 
-fn risky_cargo_args(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| arg_is(a, "--config") || a.starts_with("-Z") || a.contains("runner"))
-}
-
-fn risky_rg_args(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| arg_is(a, "--pre") || arg_is(a, "--pre-glob"))
-}
-
-fn find_risky(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        arg_is(a, "-exec")
-            || arg_is(a, "-execdir")
-            || arg_is(a, "-delete")
-            || a.starts_with("-exec=")
-            || a.starts_with("-execdir=")
-    })
-}
-
-struct GitScan {
-    /// Args after known leading globals (for deny / subcommand).
-    rest: usize,
-    /// A leading global option was not in the known list (allow path fails closed).
-    unknown_global: bool,
-}
-
-fn git_known_global_takes_value(flag: &str) -> bool {
-    flag == "-C"
-        || flag == "-c"
-        || flag == "--git-dir"
-        || flag == "--work-tree"
-        || flag == "--namespace"
-        || flag == "--exec-path"
-        || flag == "--config-env"
-        || flag == "--config"
-}
-
-fn git_known_global_flag(flag: &str) -> bool {
-    flag == "-p"
-        || flag == "--paginate"
-        || flag == "-P"
-        || flag == "--no-pager"
-        || flag == "--bare"
-        || flag == "--no-replace-objects"
-        || flag == "--literal-pathspecs"
-        || git_known_global_takes_value(flag)
-        || arg_is(flag, "--git-dir")
-        || arg_is(flag, "--work-tree")
-        || arg_is(flag, "--namespace")
-        || arg_is(flag, "--config-env")
-        || arg_is(flag, "--exec-path")
-}
-
-fn git_known_short_cluster(rest: &str) -> bool {
-    rest.chars().all(|c| matches!(c, 'C' | 'c' | 'P' | 'p'))
-}
-
-fn advance_git_globals(args: &[String], i: &mut usize, fail_on_unknown: bool) -> bool {
-    if *i >= args.len() {
+fn git_push_force_on_tail(tail: &[String]) -> bool {
+    if subcommand_at(tail, 0) != Some("push") {
         return false;
     }
-    let a = &args[*i];
-    if a == "-C" || a == "--work-tree" || a == "--namespace" || a == "--exec-path" {
-        if *i + 1 >= args.len() {
-            if fail_on_unknown {
-                return true;
-            }
-            *i += 1;
-            return false;
-        }
-        *i += 2;
-        return false;
-    }
-    if a == "--git-dir" {
-        if *i + 1 >= args.len() {
-            if fail_on_unknown {
-                return true;
-            }
-            *i += 1;
-            return false;
-        }
-        *i += 2;
-        return false;
-    }
-    if arg_is(a, "--git-dir")
-        || arg_is(a, "--work-tree")
-        || arg_is(a, "--namespace")
-        || arg_is(a, "--exec-path")
-        || arg_is(a, "--config-env")
-    {
-        *i += 1;
-        return false;
-    }
-    if a.starts_with("-C") && a.len() > 2 {
-        *i += 1;
-        return false;
-    }
-    if a == "-c" || a == "--config" || a == "--config-env" {
-        if *i + 1 >= args.len() {
-            if fail_on_unknown {
-                return true;
-            }
-            *i += 1;
-            return false;
-        }
-        *i += 2;
-        return false;
-    }
-    if a.starts_with("-c") && a.len() > 2 {
-        *i += 1;
-        return false;
-    }
-    if git_known_global_flag(a) {
-        *i += 1;
-        return false;
-    }
-    if a.starts_with('-') && !a.starts_with("--") {
-        let rest = &a[1..];
-        if git_known_short_cluster(rest) {
-            for c in rest.chars() {
-                match c {
-                    'C' | 'c' => {
-                        if *i + 1 < args.len() {
-                            *i += 2;
-                        } else if fail_on_unknown {
-                            return true;
-                        } else {
-                            *i += 1;
-                            return false;
-                        }
-                    }
-                    'P' | 'p' => {
-                        *i += 1;
-                    }
-                    _ => {}
-                }
-            }
-            return false;
-        }
-        if fail_on_unknown {
-            return true;
-        }
-        *i += 1;
-        return false;
-    }
-    if a.starts_with("--") {
-        if fail_on_unknown {
-            return true;
-        }
-        *i += 1;
-        return false;
-    }
-    false
-}
-
-fn scan_git_globals(args: &[String]) -> GitScan {
-    let mut i = 0;
-    while i < args.len() {
-        if advance_git_globals(args, &mut i, true) {
-            return GitScan {
-                rest: i,
-                unknown_global: true,
-            };
-        }
-        if i < args.len() && !args[i].starts_with('-') {
-            break;
-        }
-        if i >= args.len() {
-            break;
-        }
-    }
-    GitScan {
-        rest: i,
-        unknown_global: false,
-    }
-}
-
-fn git_subcommand_slice_for_deny(args: &[String]) -> &[String] {
-    let mut i = 0;
-    while i < args.len() {
-        if advance_git_globals(args, &mut i, false) {
-            break;
-        }
-        if i < args.len() && args[i].starts_with('-') {
-            i += 1;
-            continue;
-        }
-        break;
-    }
-    args.get(i..).unwrap_or(&[])
-}
-
-fn git_push_force(args: &[String]) -> bool {
-    if subcommand(args) != Some("push") {
-        return false;
-    }
-    for a in args.iter().skip(1) {
+    for a in tail.iter().skip(1) {
         if arg_is(a, "--force") || a.starts_with("--force-with-lease") {
             return true;
         }
@@ -361,6 +339,26 @@ fn git_push_force(args: &[String]) -> bool {
         }
     }
     false
+}
+
+fn git_push_force_in_args(args: &[String]) -> bool {
+    for idx in 0..args.len() {
+        if args[idx] == "push" && git_push_force_on_tail(&args[idx..]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn git_clean_force(tail: &[String]) -> bool {
+    if subcommand_at(tail, 0) != Some("clean") {
+        return false;
+    }
+    tail.iter().skip(1).any(|a| {
+        arg_is(a, "--force")
+            || arg_is(a, "-f")
+            || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('f'))
+    })
 }
 
 fn argv_prefix_match(argv: &[String], prefix: &[String]) -> bool {
@@ -379,22 +377,28 @@ fn argv_prefix_match(argv: &[String], prefix: &[String]) -> bool {
     true
 }
 
-fn builtin_deny_verdict(argv: &[String]) -> Option<Verdict> {
-    if argv.is_empty() {
+fn builtin_deny_on_normalized(norm: &[String]) -> Option<Verdict> {
+    if norm.is_empty() {
         return None;
     }
-    let prog = program_basename(&argv[0]);
-    let args = &argv[1..];
+    let prog = program_basename(&norm[0]);
+    let args = &norm[1..];
     if prog == "rm" && has_rm_recursive_force(args) {
         return Some(Verdict::Block("denylist: rm recursive+force".into()));
     }
     if prog == "git" {
-        let git_cmd = git_subcommand_slice_for_deny(args);
-        if git_push_force(git_cmd) {
+        if git_push_force_in_args(args) {
             return Some(Verdict::Block("denylist: git push --force".into()));
         }
-        if subcommand(git_cmd) == Some("reset") && git_cmd.iter().any(|a| arg_is(a, "--hard")) {
-            return Some(Verdict::Block("denylist: git reset --hard".into()));
+        for idx in 0..args.len() {
+            if args[idx] == "reset" && args[idx..].iter().any(|a| arg_is(a, "--hard")) {
+                return Some(Verdict::Block("denylist: git reset --hard".into()));
+            }
+        }
+        for idx in 0..args.len() {
+            if git_clean_force(&args[idx..]) {
+                return Some(Verdict::Block("denylist: git clean --force".into()));
+            }
         }
     }
     if prog == "dd" || prog == "mkfs" {
@@ -404,78 +408,347 @@ fn builtin_deny_verdict(argv: &[String]) -> Option<Verdict> {
 }
 
 fn hard_deny(argv: &[String], rules: &Rules) -> Option<Verdict> {
-    if let Some(v) = builtin_deny_verdict(argv) {
+    let norm = normalized_argv(argv);
+    if let Some(v) = builtin_deny_on_normalized(&norm) {
         return Some(v);
     }
     for prefix in &rules.deny {
-        if argv_prefix_match(argv, prefix) {
+        if argv_prefix_match(&norm, prefix) {
             return Some(Verdict::Block(format!("denylist: {}", prefix.join(" "))));
         }
     }
     None
 }
 
-fn builtin_allow_verdict(argv: &[String]) -> Option<Verdict> {
+fn path_value_inside_root(root: &str, value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        let root_path = std::path::Path::new(root);
+        if let (Ok(r), Ok(p)) = (root_path.canonicalize(), path.canonicalize()) {
+            return p.starts_with(r);
+        }
+        let root_slash = if root.ends_with('/') {
+            root.to_owned()
+        } else {
+            format!("{root}/")
+        };
+        return value == root || value.starts_with(&root_slash);
+    }
+    true
+}
+
+fn advance_one_flag(args: &[String], i: &mut usize, defs: &[FlagDef], root: &str) -> Option<bool> {
+    if *i >= args.len() {
+        return Some(false);
+    }
+    let a = &args[*i];
+    if let Some(name) = long_flag_name(a) {
+        if matches!(
+            name,
+            "output" | "textconv" | "ext-diff" | "config" | "config-env"
+        ) {
+            return Some(false);
+        }
+        let def = defs.iter().find(|d| d.long == name)?;
+        let inline = a.split_once('=').map(|(_, v)| v);
+        *i += 1;
+        let value = match def.arity {
+            FlagArity::Flag => None,
+            FlagArity::TakesValue | FlagArity::EqOrValue => {
+                if let Some(v) = inline {
+                    Some(v)
+                } else if *i < args.len() {
+                    let v = args[*i].as_str();
+                    *i += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        };
+        if def.path_value {
+            if let Some(v) = value {
+                if !path_value_inside_root(root, v) {
+                    return Some(false);
+                }
+            }
+        }
+        return Some(true);
+    }
+    if a.starts_with('-') && !a.starts_with("--") {
+        let rest = &a[1..];
+        if rest.is_empty() {
+            return Some(false);
+        }
+        if rest.len() == 1 {
+            let ch = rest.chars().next().expect("one char");
+            let def = defs.iter().find(|d| d.short == Some(ch))?;
+            *i += 1;
+            if def.arity != FlagArity::Flag {
+                if *i >= args.len() {
+                    return Some(false);
+                }
+                let v = args[*i].as_str();
+                *i += 1;
+                if def.path_value && !path_value_inside_root(root, v) {
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+        for ch in rest.chars() {
+            let def = defs.iter().find(|d| d.short == Some(ch));
+            match def {
+                Some(d) if d.arity == FlagArity::Flag => {}
+                _ => return Some(false),
+            }
+        }
+        *i += 1;
+        return Some(true);
+    }
+    if a.starts_with('-') {
+        return Some(false);
+    }
+    *i += 1;
+    Some(true)
+}
+
+const CARGO_SUB_FLAGS: &[FlagDef] = &[
+    FlagDef {
+        long: "package",
+        short: Some('p'),
+        arity: FlagArity::TakesValue,
+        path_value: false,
+    },
+    FlagDef {
+        long: "manifest-path",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: true,
+    },
+    FlagDef {
+        long: "target-dir",
+        short: None,
+        arity: FlagArity::EqOrValue,
+        path_value: true,
+    },
+    FlagDef {
+        long: "all",
+        short: None,
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "quiet",
+        short: Some('q'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "verbose",
+        short: Some('v'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+];
+
+const GIT_STATUS_FLAGS: &[FlagDef] = &[
+    FlagDef {
+        long: "short",
+        short: Some('s'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "branch",
+        short: Some('b'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+];
+
+const GIT_DIFF_FLAGS: &[FlagDef] = &[FlagDef {
+    long: "stat",
+    short: None,
+    arity: FlagArity::Flag,
+    path_value: false,
+}];
+
+const GIT_LOG_FLAGS: &[FlagDef] = &[
+    FlagDef {
+        long: "oneline",
+        short: None,
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "max-count",
+        short: Some('n'),
+        arity: FlagArity::TakesValue,
+        path_value: false,
+    },
+];
+
+const RG_FLAGS: &[FlagDef] = &[
+    FlagDef {
+        long: "line-number",
+        short: Some('n'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+    FlagDef {
+        long: "files-with-matches",
+        short: Some('l'),
+        arity: FlagArity::Flag,
+        path_value: false,
+    },
+];
+
+fn cargo_sub_flags(sub: &str) -> Option<&'static [FlagDef]> {
+    match sub {
+        "test" | "check" | "build" => Some(CARGO_SUB_FLAGS),
+        _ => None,
+    }
+}
+
+fn git_sub_flags(sub: &str) -> Option<&'static [FlagDef]> {
+    match sub {
+        "status" => Some(GIT_STATUS_FLAGS),
+        "diff" => Some(GIT_DIFF_FLAGS),
+        "log" => Some(GIT_LOG_FLAGS),
+        _ => None,
+    }
+}
+
+fn parse_git_allow(args: &[String], root: &str) -> bool {
+    let mut i = 0;
+    let mut steps = 0;
+    while i < args.len() && steps <= args.len() + 4 {
+        if !args[i].starts_with('-') {
+            break;
+        }
+        let before = i;
+        if advance_git_global(args, &mut i) {
+            return false;
+        }
+        if i == before {
+            return false;
+        }
+        steps += 1;
+    }
+    if i >= args.len() {
+        return false;
+    }
+    let sub = args[i].as_str();
+    let flags = match git_sub_flags(sub) {
+        Some(f) => f,
+        None => return false,
+    };
+    i += 1;
+    while i < args.len() {
+        steps += 1;
+        if steps > args.len() * 2 + 8 {
+            return false;
+        }
+        if advance_one_flag(args, &mut i, flags, root) != Some(true) {
+            return false;
+        }
+    }
+    true
+}
+
+fn schema_allows(argv: &[String], root: &str) -> bool {
     if argv.is_empty() {
-        return None;
+        return false;
     }
     let prog = program_basename(&argv[0]);
     let args = &argv[1..];
     match prog {
         "cargo" => {
-            let sub = subcommand(args)?;
-            if !matches!(sub, "test" | "check" | "build") {
-                return None;
+            if args.is_empty() {
+                return false;
             }
-            if risky_cargo_args(&args[1..]) {
-                return None;
+            let sub = args[0].as_str();
+            let flags = match cargo_sub_flags(sub) {
+                Some(f) => f,
+                None => return false,
+            };
+            let mut i = 1;
+            let mut steps = 0;
+            while i < args.len() {
+                steps += 1;
+                if steps > args.len() * 2 + 8 {
+                    return false;
+                }
+                if advance_one_flag(args, &mut i, flags, root) != Some(true) {
+                    return false;
+                }
             }
-            Some(Verdict::Allow)
+            !args
+                .iter()
+                .any(|a| arg_is(a, "--config") || a.starts_with("-Z") || a.contains("runner"))
         }
-        "git" => {
-            let scan = scan_git_globals(args);
-            if scan.unknown_global {
-                return None;
+        "git" => parse_git_allow(args, root),
+        "rg" => {
+            let mut i = 0;
+            let mut steps = 0;
+            while i < args.len() {
+                steps += 1;
+                if steps > args.len() * 2 + 8 {
+                    return false;
+                }
+                if advance_one_flag(args, &mut i, RG_FLAGS, root) != Some(true) {
+                    return false;
+                }
             }
-            let git_cmd = args.get(scan.rest..).unwrap_or(&[]);
-            let sub = subcommand(git_cmd)?;
-            if !matches!(sub, "status" | "diff" | "log") {
-                return None;
-            }
-            if has_git_config_injection(args) {
-                return None;
-            }
-            Some(Verdict::Allow)
+            true
         }
-        "rg" if !risky_rg_args(args) => Some(Verdict::Allow),
-        "ls" => Some(Verdict::Allow),
-        "env" | "bash" | "sh" | "zsh" | "xargs" => None,
-        "find" if find_risky(args) => None,
-        "find" => None,
-        _ => None,
+        "ls" => {
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a.starts_with('-') {
+                    if a == "--" {
+                        i += 1;
+                        continue;
+                    }
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        _ => false,
     }
 }
 
-fn hard_allow(argv: &[String], rules: &Rules) -> Option<Verdict> {
+fn hard_allow(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
     for prefix in &rules.allow {
         if argv_prefix_match(argv, prefix) {
-            let prog = program_basename(&argv.first().map(String::as_str).unwrap_or(""));
+            let prog = program_basename(argv.first().map(String::as_str).unwrap_or(""));
             if matches!(prog, "cargo" | "git" | "rg") {
-                return builtin_allow_verdict(argv);
+                if schema_allows(argv, root) {
+                    return Some(Verdict::Allow);
+                }
+                return None;
             }
             return Some(Verdict::Allow);
         }
     }
-    builtin_allow_verdict(argv)
+    if schema_allows(argv, root) {
+        Some(Verdict::Allow)
+    } else {
+        None
+    }
 }
 
 /// Deterministic verdict from [`Rules`], or `None` when Jev should judge.
 #[must_use]
-pub fn rules_verdict(argv: &[String], rules: &Rules) -> Option<Verdict> {
+pub fn rules_verdict(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
     if let Some(v) = hard_deny(argv, rules) {
         return Some(v);
     }
-    hard_allow(argv, rules)
+    hard_allow(argv, rules, root)
 }
 
 /// Cache key for Jev verdicts (root + argv).
@@ -565,7 +838,7 @@ pub async fn enforce(
     let argv: Vec<String> = std::iter::once(program.to_owned())
         .chain(args.iter().cloned())
         .collect();
-    if let Some(v) = rules_verdict(&argv, rules) {
+    if let Some(v) = rules_verdict(&argv, rules, root) {
         return Ok(v);
     }
     let key = GateCacheKey {
@@ -704,6 +977,8 @@ impl Gate {
 mod tests {
     use super::*;
 
+    const TEST_ROOT: &str = "/tmp/toolgate-allow-root";
+
     #[test]
     fn policy_matches_article_numbers() {
         let policy = Policy::default();
@@ -719,7 +994,10 @@ mod tests {
     fn rules_allow_cargo_test() {
         let rules = Rules::default();
         let argv = vec!["cargo".into(), "test".into(), "-p".into(), "foo".into()];
-        assert!(matches!(rules_verdict(&argv, &rules), Some(Verdict::Allow)));
+        assert!(matches!(
+            rules_verdict(&argv, &rules, TEST_ROOT),
+            Some(Verdict::Allow)
+        ));
     }
 
     #[test]
@@ -732,7 +1010,10 @@ mod tests {
             vec!["/bin/rm".into(), "--recursive".into(), "--force".into()],
         ] {
             assert!(
-                matches!(rules_verdict(&argv, &rules), Some(Verdict::Block(_))),
+                matches!(
+                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    Some(Verdict::Block(_))
+                ),
                 "{argv:?}"
             );
         }
@@ -756,8 +1037,9 @@ mod tests {
                 "-p".into(),
                 "my-runner-crate".into(),
             ],
-            vec!["git".into(), "diff".into(), "-c".into(), "x=y".into()],
-            vec!["git".into(), "log".into(), "--config".into(), "x=y".into()],
+            vec!["git".into(), "diff".into(), "--output".into(), "x".into()],
+            vec!["git".into(), "log".into(), "--ext-diff".into()],
+            vec!["git".into(), "diff".into(), "--textconv".into()],
             vec!["git".into(), "fetch".into()],
             vec!["env".into(), "FOO=bar".into()],
             vec!["bash".into(), "-c".into(), "echo".into()],
@@ -771,7 +1053,10 @@ mod tests {
             ],
         ];
         for argv in cases {
-            assert!(rules_verdict(&argv, &rules).is_none(), "{argv:?}");
+            assert!(
+                rules_verdict(&argv, &rules, TEST_ROOT).is_none(),
+                "{argv:?}"
+            );
         }
     }
 
@@ -779,7 +1064,10 @@ mod tests {
     fn git_status_without_config_still_allowed() {
         let rules = Rules::default();
         let argv = vec!["git".into(), "status".into()];
-        assert!(matches!(rules_verdict(&argv, &rules), Some(Verdict::Allow)));
+        assert!(matches!(
+            rules_verdict(&argv, &rules, TEST_ROOT),
+            Some(Verdict::Allow)
+        ));
     }
 
     #[test]
@@ -801,7 +1089,10 @@ mod tests {
             ],
         ] {
             assert!(
-                matches!(rules_verdict(&argv, &rules), Some(Verdict::Block(_))),
+                matches!(
+                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    Some(Verdict::Block(_))
+                ),
                 "{argv:?}"
             );
         }
@@ -814,21 +1105,21 @@ mod tests {
             deny: vec![vec!["wget".into()]],
         };
         assert!(matches!(
-            rules_verdict(&vec!["echo".into(), "hi".into()], &rules),
+            rules_verdict(&vec!["echo".into(), "hi".into()], &rules, TEST_ROOT),
             Some(Verdict::Allow)
         ));
         assert!(matches!(
-            rules_verdict(&vec!["wget".into(), "https://x".into()], &rules),
+            rules_verdict(&vec!["wget".into(), "https://x".into()], &rules, TEST_ROOT),
             Some(Verdict::Block(_))
         ));
-        assert!(rules_verdict(&vec!["curl".into(), "x".into()], &rules).is_none());
+        assert!(rules_verdict(&vec!["curl".into(), "x".into()], &rules, TEST_ROOT).is_none());
     }
 
     #[test]
     fn rules_unknown_needs_jev() {
         let rules = Rules::default();
         let argv = vec!["curl".into(), "https://example.com".into()];
-        assert!(rules_verdict(&argv, &rules).is_none());
+        assert!(rules_verdict(&argv, &rules, TEST_ROOT).is_none());
     }
 
     #[test]
@@ -867,7 +1158,10 @@ mod tests {
         ];
         for argv in cases {
             assert!(
-                matches!(rules_verdict(&argv, &rules), Some(Verdict::Block(_))),
+                matches!(
+                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    Some(Verdict::Block(_))
+                ),
                 "{argv:?}"
             );
         }
@@ -877,7 +1171,7 @@ mod tests {
     fn git_unknown_global_never_allow() {
         let rules = Rules::default();
         let argv = vec!["git".into(), "--weird-global".into(), "status".into()];
-        assert!(rules_verdict(&argv, &rules).is_none());
+        assert!(rules_verdict(&argv, &rules, TEST_ROOT).is_none());
     }
 
     #[test]
@@ -888,9 +1182,162 @@ mod tests {
         };
         let argv = vec!["git".into(), "push".into(), "-f".into()];
         assert!(matches!(
-            rules_verdict(&argv, &rules),
+            rules_verdict(&argv, &rules, TEST_ROOT),
             Some(Verdict::Block(_))
         ));
+    }
+
+    #[test]
+    fn git_pager_cluster_does_not_skip_push_force_deny() {
+        let rules = Rules::default();
+        let argv = vec!["git".into(), "-pp".into(), "push".into(), "--force".into()];
+        assert!(matches!(
+            rules_verdict(&argv, &rules, TEST_ROOT),
+            Some(Verdict::Block(_))
+        ));
+    }
+
+    #[test]
+    fn git_bare_dash_argv_does_not_loop() {
+        let rules = Rules::default();
+        for argv in [
+            vec!["git".into(), "-".into(), "diff".into()],
+            vec!["git".into(), "-".into(), "push".into(), "-f".into()],
+        ] {
+            let v = rules_verdict(&argv, &rules, TEST_ROOT);
+            if argv.contains(&"-f".into()) || argv.iter().any(|a| a == "push") {
+                assert!(matches!(v, Some(Verdict::Block(_))), "{argv:?}");
+            } else {
+                assert!(v.is_none(), "{argv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rules_deny_matches_normalized_git_prefix() {
+        let rules = Rules {
+            allow: vec![],
+            deny: vec![vec!["git".into(), "push".into()]],
+        };
+        let argv = vec![
+            "git".into(),
+            "-C".into(),
+            "d".into(),
+            "push".into(),
+            "origin".into(),
+        ];
+        assert!(matches!(
+            rules_verdict(&argv, &rules, TEST_ROOT),
+            Some(Verdict::Block(_))
+        ));
+    }
+
+    #[test]
+    fn cargo_paths_outside_root_need_jev() {
+        let rules = Rules::default();
+        let outside = "/outside/Cargo.toml";
+        for argv in [
+            vec![
+                "cargo".into(),
+                "test".into(),
+                "--manifest-path".into(),
+                outside.into(),
+            ],
+            vec![
+                "cargo".into(),
+                "build".into(),
+                "--target-dir".into(),
+                "/outside".into(),
+            ],
+        ] {
+            assert!(
+                rules_verdict(&argv, &rules, TEST_ROOT).is_none(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rg_safe_flags_allow_pre_flags_do_not() {
+        let rules = Rules::default();
+        assert!(matches!(
+            rules_verdict(
+                &vec!["rg".into(), "fn".into(), "src".into()],
+                &rules,
+                TEST_ROOT
+            ),
+            Some(Verdict::Allow)
+        ));
+        for argv in [
+            vec!["rg".into(), "--pre".into(), "sh".into(), "x".into()],
+            vec!["rg".into(), "--pre-glob".into(), "*.sh".into()],
+        ] {
+            assert!(
+                rules_verdict(&argv, &rules, TEST_ROOT).is_none(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_table_cargo_git_ls() {
+        let rules = Rules::default();
+        let allow_cases: Vec<Vec<String>> = vec![
+            vec!["cargo".into(), "check".into()],
+            vec!["cargo".into(), "test".into(), "-p".into(), "foo".into()],
+            vec!["git".into(), "diff".into(), "--stat".into()],
+            vec!["ls".into(), "src".into()],
+        ];
+        for argv in allow_cases {
+            assert!(
+                matches!(
+                    rules_verdict(&argv, &rules, TEST_ROOT),
+                    Some(Verdict::Allow)
+                ),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_fuzz_token_pool_bounded() {
+        let rules = Rules::default();
+        let pool: Vec<String> = vec![
+            "cargo".into(),
+            "test".into(),
+            "-p".into(),
+            "foo".into(),
+            "--manifest-path".into(),
+            format!("{TEST_ROOT}/Cargo.toml"),
+            "--target-dir".into(),
+            format!("{TEST_ROOT}/target"),
+            "--pre".into(),
+            "--output=x".into(),
+            "-".into(),
+            "-pp".into(),
+            "git".into(),
+            "diff".into(),
+            "push".into(),
+            "-f".into(),
+            "+ref".into(),
+            "/outside/x".into(),
+        ];
+        let mut rng_state: u64 = 0xDEAD_BEEF;
+        for _ in 0..200 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = (rng_state % 8) as usize + 1;
+            let mut argv = Vec::new();
+            for j in 0..len {
+                let idx = ((rng_state >> (j * 3)) as usize) % pool.len();
+                argv.push(pool[idx].clone());
+            }
+            let steps_before = argv.len();
+            let v = rules_verdict(&argv, &rules, TEST_ROOT);
+            assert!(steps_before <= 16);
+            if matches!(v, Some(Verdict::Allow)) {
+                assert!(schema_allows(&argv, TEST_ROOT), "{argv:?}");
+            }
+        }
     }
 
     #[test]

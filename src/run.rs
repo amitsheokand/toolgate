@@ -153,11 +153,12 @@ impl StreamClipper {
         let take = self.tail_cap.min(tail_bytes.len());
         let tail_window = &tail_bytes[tail_bytes.len() - take..];
         let tail_start = snap_start(tail_window);
-        let tail_end = snap_end(tail_window).max(tail_start);
-        let tail_kept = tail_end - tail_start;
+        let tail_suffix = &tail_window[tail_start..];
+        let tail_end = snap_end(tail_suffix);
+        let tail_kept = tail_end;
         let elided = self.total - head_kept - tail_kept;
         let head_s = bytes_to_str(&self.head[..head_end]);
-        let tail_s = bytes_to_str(&tail_window[tail_start..tail_end]);
+        let tail_s = bytes_to_str(&tail_suffix[..tail_end]);
         format!("{head_s}... [{elided} bytes elided] ...{tail_s}")
     }
 }
@@ -576,10 +577,9 @@ mod tests {
         assert_clip_no_fffd_and_elided(3, 4, "aa", '🎉', b"bbbbbbbbbb", "cc");
     }
 
-    fn clip_parts(out: &str) -> (usize, usize, usize) {
+    fn clip_parts(out: &str) -> (String, String, usize) {
         if !out.contains("bytes elided") {
-            let kept = out.as_bytes().len();
-            return (kept, 0, 0);
+            return (out.to_owned(), String::new(), 0);
         }
         let (head_part, tail_and_mid) = out.split_once("... [").expect("split head");
         let (mid, tail_part) = tail_and_mid.split_once("] ...").expect("split tail");
@@ -588,11 +588,32 @@ mod tests {
             .expect("elided suffix")
             .parse()
             .expect("elided number");
-        (
-            head_part.as_bytes().len(),
-            tail_part.as_bytes().len(),
-            elided,
-        )
+        (head_part.to_owned(), tail_part.to_owned(), elided)
+    }
+
+    fn expected_head_tail_slices(
+        body: &[u8],
+        head_cap: usize,
+        tail_cap: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let total = body.len();
+        if total == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        if total <= head_cap {
+            return (body.to_vec(), Vec::new());
+        }
+        let head_limit = head_cap.min(total);
+        let head_end = snap_end(&body[..head_limit]);
+        if total <= head_cap + tail_cap {
+            return (body[..head_end].to_vec(), body[head_end..].to_vec());
+        }
+        let tail_take = tail_cap.min(total - head_end);
+        let tail_window = &body[total - tail_take..];
+        let tail_start = snap_start(tail_window);
+        let tail_suffix = &tail_window[tail_start..];
+        let tail_end = snap_end(tail_suffix);
+        (body[..head_end].to_vec(), tail_suffix[..tail_end].to_vec())
     }
 
     #[test]
@@ -604,29 +625,49 @@ mod tests {
                 seq.push(*ch);
             }
         }
+        let body_bytes = seq.as_bytes();
         for split in 0..=seq.len() {
             let body = format!(
                 "{}{}",
                 seq.get(..split).unwrap_or(""),
                 seq.get(split..).unwrap_or("")
             );
-            let total = body.as_bytes().len();
+            let bytes = body.as_bytes();
+            let total = bytes.len();
             for cap in 0..=64 {
                 let (head_cap, tail_cap) = head_tail_caps(cap);
                 let mut c = StreamClipper::new(head_cap, tail_cap);
-                c.push(body.as_bytes());
+                c.push(bytes);
                 let out = c.finish();
                 assert!(
                     !out.contains('\u{FFFD}'),
                     "cap={cap} split={split} body_len={total}: {out:?}"
                 );
-                let (head_kept, tail_kept, elided) = clip_parts(&out);
+                let (head_part, tail_part, elided) = clip_parts(&out);
+                let (exp_head, exp_tail) = expected_head_tail_slices(bytes, head_cap, tail_cap);
                 assert_eq!(
-                    head_kept + tail_kept + elided,
+                    head_part.as_bytes(),
+                    exp_head.as_slice(),
+                    "head bytes cap={cap} split={split}"
+                );
+                assert_eq!(
+                    tail_part.as_bytes(),
+                    exp_tail.as_slice(),
+                    "tail bytes cap={cap} split={split}"
+                );
+                assert_eq!(
+                    head_part.as_bytes().len() + tail_part.as_bytes().len() + elided,
                     total,
                     "cap={cap} split={split}"
                 );
+                if head_cap > 0 && tail_cap > 0 && total > head_cap + 3 {
+                    assert!(
+                        !tail_part.is_empty(),
+                        "tail empty cap={cap} split={split} total={total}"
+                    );
+                }
             }
         }
+        let _ = body_bytes;
     }
 }
