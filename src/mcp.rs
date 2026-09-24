@@ -1,6 +1,10 @@
 //! MCP server: the `read` gate over stdio (HTTP later if needed).
 
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use rmcp::{
     ErrorData as McpError, ServiceExt,
@@ -10,7 +14,7 @@ use rmcp::{
     transport::stdio,
 };
 
-use crate::read;
+use crate::{gate, read};
 
 fn check_root(root: &str) -> Result<PathBuf, McpError> {
     let path = PathBuf::from(root);
@@ -33,6 +37,10 @@ fn invalid(e: impl std::fmt::Display) -> McpError {
     McpError::invalid_params(e.to_string(), None)
 }
 
+fn internal(e: impl std::fmt::Display) -> McpError {
+    McpError::internal_error(e.to_string(), None)
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct RunParams {
     /// Absolute workspace root (working directory).
@@ -43,9 +51,6 @@ struct RunParams {
     args: Option<Vec<String>>,
     /// Wall-clock budget in seconds (default 120).
     timeout: Option<u64>,
-    /// Ask the Jev safety gate first (needs `TYPESAFE_API_KEY`).
-    /// Refusals fail closed: no key, no run.
-    gate: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -78,20 +83,91 @@ struct ReadParams {
     end: Option<u64>,
 }
 
+struct ToolGateState {
+    gate_mode: gate::GateMode,
+    rules: gate::Rules,
+    verdict_cache: Mutex<HashMap<Vec<String>, gate::Verdict>>,
+    #[cfg(feature = "jev")]
+    jev: Mutex<Option<Arc<gate::Gate>>>,
+}
+
 #[derive(Clone)]
 pub struct ToolGate {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    state: Arc<ToolGateState>,
 }
 
 #[tool_router]
 impl ToolGate {
-    /// Create the server.
+    /// Create the server with the given gate mode (`off` or `jev`).
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(gate_mode: gate::GateMode) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            state: Arc::new(ToolGateState {
+                gate_mode,
+                rules: gate::Rules::default(),
+                verdict_cache: Mutex::new(HashMap::new()),
+                #[cfg(feature = "jev")]
+                jev: Mutex::new(None),
+            }),
         }
+    }
+
+    fn verdict_to_mcp(verdict: gate::Verdict) -> Result<(), McpError> {
+        match verdict {
+            gate::Verdict::Allow => Ok(()),
+            gate::Verdict::Ask(reason) => {
+                Err(internal(format!("safety gate withholds run ({reason})")))
+            }
+            gate::Verdict::Block(reason) => {
+                Err(internal(format!("safety gate refused run ({reason})")))
+            }
+        }
+    }
+
+    #[cfg(feature = "jev")]
+    async fn enforce_run_gate(
+        &self,
+        program: &str,
+        args: &[String],
+        root: &str,
+    ) -> Result<(), McpError> {
+        if self.state.gate_mode == gate::GateMode::Off {
+            return Ok(());
+        }
+        let argv: Vec<String> = std::iter::once(program.to_owned())
+            .chain(args.iter().cloned())
+            .collect();
+        if let Some(v) = gate::rules_verdict(&argv, &self.state.rules) {
+            return Self::verdict_to_mcp(v);
+        }
+        {
+            let cache = self.state.verdict_cache.lock().expect("cache lock");
+            if let Some(v) = cache.get(&argv) {
+                return Self::verdict_to_mcp(v.clone());
+            }
+        }
+        let client = {
+            let mut slot = self.state.jev.lock().expect("jev lock");
+            if slot.is_none() {
+                let built = gate::Gate::from_env()
+                    .map_err(|e| internal(format!("safety gate unavailable: {e}")))?;
+                *slot = Some(Arc::new(built));
+            }
+            Arc::clone(slot.as_ref().expect("jev initialized"))
+        };
+        let score = client
+            .judge(&argv, root)
+            .await
+            .map_err(|e| internal(format!("safety gate failed: {e}")))?;
+        let verdict = gate::decide(score, &gate::Policy::default());
+        {
+            let mut cache = self.state.verdict_cache.lock().expect("cache lock");
+            cache.insert(argv, verdict.clone());
+        }
+        Self::verdict_to_mcp(verdict)
     }
 
     #[tool(
@@ -112,14 +188,21 @@ impl ToolGate {
                 ));
             }
         };
-        let hit = read::read(
-            &root,
-            &p.path,
-            p.line,
-            p.radius.unwrap_or(read::DEFAULT_RADIUS),
-            range,
-            read::WHOLE_FILE_LIMIT_LINES,
-        )
+        let path = p.path;
+        let line = p.line;
+        let radius = p.radius.unwrap_or(read::DEFAULT_RADIUS);
+        let hit = tokio::task::spawn_blocking(move || {
+            read::read(
+                &root,
+                &path,
+                line,
+                radius,
+                range,
+                read::WHOLE_FILE_LIMIT_LINES,
+            )
+        })
+        .await
+        .map_err(|e| internal(e))?
         .map_err(invalid)?;
         let mut out = format!(
             "{}:{}-{} of {} lines\n",
@@ -140,8 +223,15 @@ impl ToolGate {
         Parameters(p): Parameters<EditParams>,
     ) -> Result<CallToolResult, McpError> {
         let root = check_root(&p.root)?;
-        let hit = crate::edit::edit(&root, &p.path, &p.old, &p.new, p.all.unwrap_or(false))
-            .map_err(invalid)?;
+        let path = p.path;
+        let old = p.old;
+        let new = p.new;
+        let all = p.all.unwrap_or(false);
+        let hit =
+            tokio::task::spawn_blocking(move || crate::edit::edit(&root, &path, &old, &new, all))
+                .await
+                .map_err(|e| internal(e))?
+                .map_err(invalid)?;
         let mut out = format!(
             "{}:{}-{} ({} applied)\n",
             hit.path.display(),
@@ -154,46 +244,32 @@ impl ToolGate {
     }
 
     #[tool(
-        description = "Bounded command execution: kills on timeout, head-truncates output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell. `gate` asks the Jev safety Noul first (needs TYPESAFE_API_KEY); refusals fail closed."
+        description = "Bounded command execution: kills the process group on timeout, head+tail-clips output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell. Server gate mode (`--gate` / TOOLGATE_GATE) applies deterministic rules then Jev when enabled."
     )]
     async fn run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
         let root = check_root(&p.root)?;
-        if p.gate.unwrap_or(false) {
-            let gate = crate::gate::Gate::from_env().map_err(|e| {
-                McpError::internal_error(format!("safety gate unavailable: {e}"), None)
-            })?;
-            let root_str = root.to_string_lossy().into_owned();
-            let score = gate
-                .judge(&p.program, &p.args.clone().unwrap_or_default(), &root_str)
-                .await
-                .map_err(|e| McpError::internal_error(format!("safety gate failed: {e}"), None))?;
-            match crate::gate::decide(score, &crate::gate::Policy::default()) {
-                crate::gate::Verdict::Allow => {}
-                crate::gate::Verdict::Ask(reason) => {
-                    return Err(McpError::internal_error(
-                        format!("safety gate withholds run ({reason})"),
-                        None,
-                    ));
-                }
-                crate::gate::Verdict::Block(reason) => {
-                    return Err(McpError::internal_error(
-                        format!("safety gate refused run ({reason})"),
-                        None,
-                    ));
-                }
-            }
+        let args = p.args.unwrap_or_default();
+        let root_str = root.to_string_lossy().into_owned();
+        #[cfg(feature = "jev")]
+        self.enforce_run_gate(&p.program, &args, &root_str).await?;
+        #[cfg(all(not(feature = "jev"), feature = "server"))]
+        if self.state.gate_mode == gate::GateMode::Jev {
+            return Err(internal("jev feature disabled: cannot enforce gate"));
         }
-        let hit = crate::run::run(
-            &root,
-            &p.program,
-            &p.args.unwrap_or_default(),
-            p.timeout.unwrap_or(crate::run::DEFAULT_TIMEOUT_SECS),
-            crate::run::OUTPUT_CAP_BYTES,
-        )
-        .map_err(|e| match e {
-            crate::run::Error::Timeout(_) => McpError::internal_error(e.to_string(), None),
-            other => invalid(other),
-        })?;
+        let program = p.program;
+        let timeout = p.timeout.unwrap_or(crate::run::DEFAULT_TIMEOUT_SECS);
+        let hit = tokio::task::spawn_blocking(move || {
+            crate::run::run(
+                &root,
+                &program,
+                &args,
+                timeout,
+                crate::run::OUTPUT_CAP_BYTES,
+            )
+        })
+        .await
+        .map_err(|e| internal(e))?
+        .map_err(invalid)?;
         let mut out = format!(
             "exit={} timed_out={} elapsed_ms={}\n",
             hit.code, hit.timed_out, hit.elapsed_ms
@@ -212,7 +288,7 @@ impl ToolGate {
 
 impl Default for ToolGate {
     fn default() -> Self {
-        Self::new()
+        Self::new(gate::GateMode::Off)
     }
 }
 
@@ -234,17 +310,14 @@ impl rmcp::ServerHandler for ToolGate {
 
 /// Serve over stdio (local MCP clients).
 ///
-/// Transport failures surface as I/O errors; the read logic itself is
-/// infallible past this point.
-///
 /// # Errors
 ///
 /// Returns [`std::io::Error`] when transport setup fails.
-pub async fn serve_stdio() -> std::io::Result<()> {
+pub async fn serve_stdio(gate_mode: gate::GateMode) -> std::io::Result<()> {
     fn to_io(e: impl std::fmt::Display) -> std::io::Error {
         std::io::Error::other(e.to_string())
     }
-    ToolGate::new()
+    ToolGate::new(gate_mode)
         .serve(stdio())
         .await
         .map_err(to_io)?
@@ -260,7 +333,7 @@ mod tests {
 
     #[test]
     fn tool_router_lists_all_gates() {
-        let map = &ToolGate::new().tool_router.map;
+        let map = &ToolGate::new(gate::GateMode::Off).tool_router.map;
         for tool in ["read", "edit", "run"] {
             assert!(map.contains_key(tool), "{tool}");
         }
@@ -270,7 +343,7 @@ mod tests {
     async fn edit_tool_applies_and_returns_diff() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").expect("write");
-        let result = ToolGate::new()
+        let result = ToolGate::new(gate::GateMode::Off)
             .edit(Parameters(EditParams {
                 root: dir.path().to_string_lossy().into_owned(),
                 path: "a.txt".into(),
@@ -293,13 +366,12 @@ mod tests {
     #[tokio::test]
     async fn run_tool_reports_exit_and_truncates() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let result = ToolGate::new()
+        let result = ToolGate::new(gate::GateMode::Off)
             .run(Parameters(RunParams {
                 root: dir.path().to_string_lossy().into_owned(),
                 program: "echo".into(),
                 args: Some(vec!["hi".into()]),
                 timeout: Some(10),
-                gate: None,
             }))
             .await
             .expect("run");
@@ -324,8 +396,7 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        // Window around a line.
-        let out = ToolGate::new()
+        let out = ToolGate::new(gate::GateMode::Off)
             .read(Parameters(ReadParams {
                 root: root.clone(),
                 path: "a.txt".into(),
@@ -342,8 +413,7 @@ mod tests {
                 || body.contains(":150-350 of 500 lines"),
             "{body}"
         );
-        // Whole-file without range: refused over the limit.
-        let err = ToolGate::new()
+        let err = ToolGate::new(gate::GateMode::Off)
             .read(Parameters(ReadParams {
                 root,
                 path: "a.txt".into(),
