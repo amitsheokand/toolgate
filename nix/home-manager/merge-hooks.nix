@@ -5,7 +5,7 @@ pkgs.writeShellScript "toolgate-merge-hooks" ''
   target="$1"
   shift
   tmp=$(mktemp)
-  if [ -f "$target" ]; then
+  if [ -f "$target" ] && [ -s "$target" ]; then
     cp "$target" "$tmp"
   else
     echo '{}' > "$tmp"
@@ -16,9 +16,11 @@ pkgs.writeShellScript "toolgate-merge-hooks" ''
       elif e.command? then e.command
       elif e.hooks? and (e.hooks | length) > 0 then e.hooks[0].command
       else null end;
+    def has_toolgate_bin($bin; $cmd):
+      ($cmd | type) == "string" and ($cmd | test("(^|[ /])" + $bin + "([ ]|$)"));
     def toolgate_stable_key($bin; $cmd):
       if ($cmd | type) != "string" then null
-      elif ($cmd | contains($bin)) and ($cmd | contains("hook --harness")) then
+      elif has_toolgate_bin($bin; $cmd) and ($cmd | contains("hook --harness")) then
         ($cmd | capture("(?<s>hook --harness .+)").s)
       else null end;
     def entry_toolgate_key($bin; e):
@@ -37,8 +39,15 @@ pkgs.writeShellScript "toolgate-merge-hooks" ''
       $base * $patch | .hooks = $merged;
     merge_hooks($bin; .[0]; .[1])
   '
+  jq_warn() {
+    echo "toolgate-merge-hooks: warning: could not merge hooks into $target (invalid JSON?); leaving file unchanged" >&2
+    rm -f "$tmp" "$tmp.new"
+    exit 0
+  }
   for patch in "$@"; do
-    ${pkgs.jq}/bin/jq -s --arg bin "${toolgateBasename}" "$merge_jq" "$tmp" "$patch" > "$tmp.new"
+    if ! ${pkgs.jq}/bin/jq -s --arg bin "${toolgateBasename}" "$merge_jq" "$tmp" "$patch" > "$tmp.new" 2>/dev/null; then
+      jq_warn
+    fi
     mv "$tmp.new" "$tmp"
   done
   mkdir -p "$(dirname "$target")"

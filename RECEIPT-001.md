@@ -57,3 +57,25 @@ warning: Git tree '/home/amitsheokand/work/worktrees/toolgate/T-tg-hm' is dirty
 - OpenCode shim: store-path binary via `replaceVars`.
 - `programs.toolgate.harnesses` gates hook installs; `mode` only in `policy.toml`; removed `mcp.enable` / `TOOLGATE_POLICY` session var.
 - Flake check `home-manager-merge` exercises Cursor + Muse merge across two synthetic store paths.
+
+## Review round 1
+
+Round 2 fixes from grok NO-GO: correct `replaceVars` call shape; merge treats empty/missing targets as `{}`, invalid JSON warns and exits 0; toolgate detection uses basename argv token; cursor/muse merge always runs (empty patch when harness disabled); flake check builds Pi/OpenCode shims (no `@TOOLGATE_BIN@`), empty/missing/invalid targets, substring peer, stale toolgate removal.
+
+### `nix flake check -L` (tail)
+
+```
+building '/nix/store/a55rl01hg61fl0bfhqnp5nmaks94syy0-toolgate-home-manager-merge-test.drv'...
+toolgate-home-manager-merge-test> Running phase: installPhase
+all checks passed!
+warning: The check omitted these incompatible systems: aarch64-darwin, aarch64-linux
+Use '--all-systems' to check all.
+```
+
+### `nix build .#toolgate` (tail)
+
+```
+warning: Git tree '/home/amitsheokand/work/worktrees/toolgate/T-tg-hm' is dirty
+```
+
+(Cache hit after `nix flake check`; no rebuild log lines.)

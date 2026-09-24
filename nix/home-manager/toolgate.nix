@@ -13,11 +13,8 @@ let
     inherit pkgs toolgateBasename;
   };
   substituteHook = src:
-    pkgs.replaceVars {
-      inherit src;
-      vars = {
-        TOOLGATE_BIN = toolgateBin;
-      };
+    pkgs.replaceVars src {
+      TOOLGATE_BIN = toolgateBin;
     };
   opencodeHook = substituteHook ../../adapters/opencode/toolgate-hook.mjs;
   piHook = substituteHook ../../adapters/pi/toolgate-hook.ts;
@@ -75,64 +72,76 @@ in
     })
     {
       home.activation.toolgateMergeHooks = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-        ${lib.optionalString (hasHarness "cursor") ''
-          cursor_patch=${pkgs.writeText "toolgate-cursor-hooks.json" (builtins.toJSON {
-            version = 1;
-            hooks = {
-              preToolUse = [
-                {
-                  matcher = "Read|Shell|Grep|Glob";
-                  command = "${toolgateBin} hook --harness cursor --event preToolUse";
-                }
-              ];
-              postToolUse = [
-                {
-                  command = "${toolgateBin} hook --harness cursor --event postToolUse";
-                }
-              ];
-              afterShellExecution = [
-                {
-                  command = "${toolgateBin} hook --harness cursor --event afterShellExecution";
-                }
-              ];
-              afterMCPExecution = [
-                {
-                  command = "${toolgateBin} hook --harness cursor --event afterMCPExecution";
-                }
-              ];
-            };
-          })}
-          ${mergeHooks} "$HOME/.cursor/hooks.json" "$cursor_patch"
-        ''}
-        ${lib.optionalString (hasHarness "muse") ''
-          muse_patch=${pkgs.writeText "toolgate-muse-hooks.json" (builtins.toJSON {
-            hooks = {
-              PreToolUse = [
-                {
-                  matcher = "Read|Shell|Grep|Glob|Bash";
-                  hooks = [
-                    {
-                      type = "command";
-                      command = "${toolgateBin} hook --harness muse --event PreToolUse";
-                    }
-                  ];
-                }
-              ];
-              PostToolUse = [
-                {
-                  hooks = [
-                    {
-                      type = "command";
-                      command = "${toolgateBin} hook --harness muse --event PostToolUse";
-                    }
-                  ];
-                }
-              ];
-            };
-          })}
-          mkdir -p "$HOME/.config/muse"
-          ${mergeHooks} "$HOME/.config/muse/settings.json" "$muse_patch"
-        ''}
+        cursor_patch=${pkgs.writeText "toolgate-cursor-hooks.json" (
+          if hasHarness "cursor" then
+            builtins.toJSON {
+              version = 1;
+              hooks = {
+                preToolUse = [
+                  {
+                    matcher = "Read|Shell|Grep|Glob";
+                    command = "${toolgateBin} hook --harness cursor --event preToolUse";
+                  }
+                ];
+                postToolUse = [
+                  {
+                    command = "${toolgateBin} hook --harness cursor --event postToolUse";
+                  }
+                ];
+                afterShellExecution = [
+                  {
+                    command = "${toolgateBin} hook --harness cursor --event afterShellExecution";
+                  }
+                ];
+                afterMCPExecution = [
+                  {
+                    command = "${toolgateBin} hook --harness cursor --event afterMCPExecution";
+                  }
+                ];
+              };
+            }
+          else
+            builtins.toJSON {
+              version = 1;
+              hooks = { };
+            }
+        )}
+        ${mergeHooks} "$HOME/.cursor/hooks.json" "$cursor_patch"
+
+        muse_patch=${pkgs.writeText "toolgate-muse-hooks.json" (
+          if hasHarness "muse" then
+            builtins.toJSON {
+              hooks = {
+                PreToolUse = [
+                  {
+                    matcher = "Read|Shell|Grep|Glob|Bash";
+                    hooks = [
+                      {
+                        type = "command";
+                        command = "${toolgateBin} hook --harness muse --event PreToolUse";
+                      }
+                    ];
+                  }
+                ];
+                PostToolUse = [
+                  {
+                    hooks = [
+                      {
+                        type = "command";
+                        command = "${toolgateBin} hook --harness muse --event PostToolUse";
+                      }
+                    ];
+                  }
+                ];
+              };
+            }
+          else
+            builtins.toJSON {
+              hooks = { };
+            }
+        )}
+        mkdir -p "$HOME/.config/muse"
+        ${mergeHooks} "$HOME/.config/muse/settings.json" "$muse_patch"
       '';
     }
   ]);
