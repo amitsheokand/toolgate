@@ -1,0 +1,10 @@
+{
+  "toolName": "read",
+  "input": {
+    "path": "big.txt",
+    "offset": 10,
+    "limit": 50
+  },
+  "sessionId": "s",
+  "cwd": "/tmp/ws"
+}

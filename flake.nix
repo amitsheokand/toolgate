@@ -70,5 +70,7 @@
       );
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
+
+      homeManagerModules.toolgate = import ./nix/home-manager/toolgate.nix;
     };
 }

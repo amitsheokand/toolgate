@@ -1,0 +1,7 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "big.txt has 500 lines; whole-file reads over 400 lines are capped. Re-read with offset/limit for the range you need, or call one-grep `context` for the enclosing symbol."
+  }
+}

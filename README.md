@@ -2,39 +2,76 @@
 
 Harness-side guardrails — the other half of the token story. one-grep
 narrows *search*; toolgate narrows what agents may *read*, *edit*, and
-*run*. Separate repo and binary on purpose: one-grep stays read-only
-search, never a gatekeeper.
+*run*. One deterministic **policy engine** (`src/policy.rs`) plus thin
+per-harness adapters; telemetry is shared so `observe` mode is the vanilla
+measurement arm.
 
-## Now: capped reads
+## Policy (`~/.config/toolgate/policy.toml`)
 
-`read` returns bounded windows, never unbounded whole-file dumps:
+| Rule | Default | Effect (enforce) |
+| --- | --- | --- |
+| `read.max_lines` | 400 | Deny whole-file reads without offset/limit |
+| `glob.require_path_scope` | true | Deny unscoped glob at repo root |
+| `grep.require_path_scope` | false | Same for grep when enabled |
+| `shell` | built-in deny/allow prefixes | Deny dangerous argv (see `gate::Rules`) |
+| `clip.min_bytes` | 4096 | Head+tail clip + archive large shell/MCP post output |
+| `mode` | enforce | `observe` logs only; never changes harness I/O |
+
+Overrides: `TOOLGATE_POLICY=enforce|observe`, `TOOLGATE_TELEMETRY=0` disables JSONL.
+
+## CLI
 
 ```bash
 toolgate read <file> [--line N] [--radius R] [--start M --end K] [--root <dir>]
-toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]  # prints its diff
-toolgate run <program> [args...] [--root <dir>] [--timeout S]          # argv-direct
-toolgate serve  # MCP stdio server (`read`, `edit`, `run`)
-toolgate hook cursor-read  # Cursor preToolUse Read cap (stdio JSON)
+toolgate edit <file> --old <text> --new <text> [--all] [--root <dir>]
+toolgate run <program> [args...] [--root <dir>] [--timeout S]
+toolgate serve --stdio   # MCP: read, edit, run (annotated hints)
+toolgate hook --harness cursor --event preToolUse   # stdio JSON hook
+toolgate hook --harness cursor --event preToolUse --record ./captures
 ```
+
+Legacy: `toolgate hook --cursor-read` → Cursor `preToolUse`.
+
+### Recording fixtures from live harnesses
+
+`--record DIR` (or `TOOLGATE_RECORD_DIR`) appends each redacted stdin payload to
+`DIR/<harness>-<event>.jsonl` (long `tool_output` / `output` fields truncated to
+200 chars) while still printing the normal hook reply on stdout. Wire the hook
+command in each harness, exercise the tool once, then copy lines from the JSONL
+into `tests/fixtures/<harness>/`:
+
+| Harness | Hook command | Typical `--event` |
+| --- | --- | --- |
+| Cursor | `toolgate hook --harness cursor --event …` | `preToolUse`, `postToolUse`, `afterShellExecution` |
+| Muse | `toolgate hook --harness muse --event …` | `PreToolUse`, `PostToolUse` |
+| OpenCode | shim calls `toolgate hook --harness opencode` | `tool.execute.before` / `after` |
+| Pi | shim calls `toolgate hook --harness pi` | `tool_call`, `tool_result` |
+
+Cursor payloads should include both `hook_event_name` and `tool_name` (common schema).
+
+## Adapter matrix
+
+| Harness | Hook events | Deny / rewrite (pre) | Replace output (post) | Source |
+| --- | --- | --- | --- | --- |
+| Cursor | `preToolUse`, `postToolUse`, `afterShellExecution`, `afterMCPExecution` | preToolUse | postToolUse MCP only (`updated_mcp_tool_output`); shell/MCP after-hooks telemetry only | [Cursor hooks](https://cursor.com/docs/agent/hooks) |
+| Muse | `PreToolUse`, `PostToolUse` | `hookSpecificOutput` + `hookEventName` on PreToolUse | PostToolUse `updatedToolOutput` in `hookSpecificOutput` | Muse settings (Claude Code–compatible JSON) |
+| OpenCode | `tool.execute.before/after` | deny throws; `args` rewrite | after `output` field | OpenCode plugin (`adapters/opencode/toolgate-hook.mjs`) |
+| Pi | `tool_call` / `tool_result` | `{ block, reason }` on tool_call | `content` on tool_result | Pi `ExtensionAPI` ([extensions docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)) |
+
+Shims (spawn `toolgate hook`, zero policy): `adapters/opencode/toolgate-hook.mjs`, `adapters/pi/toolgate-hook.mjs`.
 
 ## Install
 
-**Nix** (recommended on NixOS):
+**Nix:**
 
 ```bash
 nix build .#toolgate
 ./result/bin/toolgate --version
-nix develop   # cargo/clippy/rustfmt with link inputs from the package
 ```
 
-**Cargo** (elsewhere):
+Home Manager: `imports = [ inputs.toolgate.homeManagerModules.toolgate ];` then `programs.toolgate.enable = true;`.
 
-```bash
-cargo install --git https://github.com/amitsheokand/toolgate
-toolgate install  # not yet: register manually for now
-```
-
-opencode (`~/.config/opencode/opencode.json`, preserves peers):
+**MCP (OpenCode example):**
 
 ```json
 { "mcp": { "toolgate": {
@@ -43,51 +80,9 @@ opencode (`~/.config/opencode/opencode.json`, preserves peers):
   "enabled": true } } }
 ```
 
-Restart the harness after (re)builds: the running server keeps serving
-its loaded image.
+## Gates (library)
 
-- `--line N`: ~200-line window around N (default radius 100), clamped.
-- No `--line`: files ≤ 400 lines read whole; larger files require
-  `--start/--end` (or `--line`) — the error names the count and flags.
-- Escapes (including symlink breakout), binaries (NUL), and overlong
-  lines (truncated in read output with a marker) are handled as above.
-- Read output prefixes each line with `N|` (1-based, right-aligned).
-
-### Cursor `preToolUse` (Read)
-
-Register in `~/.cursor/hooks.json` (merge with your existing hooks):
-
-```json
-{
-  "hooks": {
-    "preToolUse": [
-      {
-        "matcher": "Read",
-        "command": "/home/amitsheokand/.local/bin/toolgate hook cursor-read"
-      }
-    ]
-  }
-}
-```
-
-Whole-file reads of files over 400 lines are **denied** with an
-`agent_message` naming the line count (offset/limit reads pass through).
-Set `TOOLGATE_READ_HOOK=0` to disable. The hook always exits 0 and prints
-exactly one JSON object; I/O or parse failures emit `{"permission":"allow"}`.
-
-## Gates
-
-- `read`: windows by default, ranges on demand (above).
-- `edit`: exact-string replacement returning its capped diff.
-- `run`: timeout + head/tail output clip (8 KiB per stream, 2 KiB head /
-  6 KiB tail), process-group kill on timeout (output kept). argv-direct.
-  `toolgate serve --gate jev` (or `TOOLGATE_GATE=jev`) applies deterministic
-  allow/deny prefixes first, then Jev for the rest (`TYPESAFE_API_KEY`
-  required; missing key refuses). Thresholds in `gate::Policy` (`block_at`
-  0.65, `ask_at` 0.35) are uncalibrated — tune from logs.
-
-## Joining the measurement
-
-one-grep's serving log (`~/.one-grep/serving.log`) records cited paths
-per search; pi's `one-grep-hits` correlator logs reads. Join by
-timestamp+path for "hits → did they still read the file?".
+- `read`: bounded windows; symlink-safe root walks.
+- `edit`: exact-string replace + diff.
+- `run`: timeout + head/tail clip; optional Jev gate on MCP `run`.
+- `hook`: fail-open JSON hooks + `events.jsonl` telemetry (digests only).

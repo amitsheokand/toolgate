@@ -175,7 +175,8 @@ impl ToolGate {
     }
 
     #[tool(
-        description = "Bounded file read. `line` returns a window around it (~200 lines, never the whole file); without `line`, files over 400 lines require explicit `start`/`end`. Escapes, binaries, and generated files are refused. Cite what you read."
+        description = "Bounded file read. `line` returns a window around it (~200 lines, never the whole file); without `line`, files over 400 lines require explicit `start`/`end`. Escapes, binaries, and generated files are refused. Cite what you read.",
+        annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn read(
         &self,
@@ -221,7 +222,8 @@ impl ToolGate {
     }
 
     #[tool(
-        description = "Exact-string edit that returns its diff. `old` must match once (or pass `all`); the response is the bounded diff, so no re-read is needed to check the write."
+        description = "Exact-string edit that returns its diff. `old` must match once (or pass `all`); the response is the bounded diff, so no re-read is needed to check the write.",
+        annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn edit(
         &self,
@@ -249,7 +251,8 @@ impl ToolGate {
     }
 
     #[tool(
-        description = "Bounded command execution: kills the process group on timeout, head+tail-clips output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell. Server gate mode (`--gate` / TOOLGATE_GATE) applies deterministic rules then Jev when enabled."
+        description = "Bounded command execution: kills the process group on timeout, head+tail-clips output. Returns exit code, verdict, and capped stdout/stderr. argv-direct, no shell. Server gate mode (`--gate` / TOOLGATE_GATE) applies deterministic rules then Jev when enabled.",
+        annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
         let root = check_root(&p.root)?;
@@ -341,6 +344,30 @@ mod tests {
         let map = &ToolGate::new(gate::GateMode::Off).tool_router.map;
         for tool in ["read", "edit", "run"] {
             assert!(map.contains_key(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn every_tool_declares_mcp_annotations() {
+        let gate = ToolGate::new(gate::GateMode::Off);
+        let map = &gate.tool_router.map;
+        for (name, tool) in map.iter() {
+            let ann = tool
+                .attr
+                .annotations
+                .as_ref()
+                .expect("annotations required for {name}");
+            match name.as_ref() {
+                "read" => {
+                    assert_eq!(ann.read_only_hint, Some(true));
+                    assert_eq!(ann.destructive_hint, Some(false));
+                }
+                "edit" | "run" => {
+                    assert_eq!(ann.read_only_hint, Some(false));
+                    assert_eq!(ann.destructive_hint, Some(true));
+                }
+                other => panic!("unexpected tool {other}"),
+            }
         }
     }
 

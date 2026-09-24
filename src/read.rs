@@ -35,6 +35,20 @@ pub const MAX_LINE_CHARS: usize = 8192;
 
 const TRUNCATED_LINE_MARKER: &str = " ... (line truncated)";
 
+/// Count lines in a UTF-8 text file at `path` (binary or unreadable → `None`).
+#[must_use]
+pub fn count_file_lines(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    if text.is_empty() {
+        return Some(0);
+    }
+    Some(text.lines().count() as u64)
+}
+
 /// Read errors: all caller-visible, none dump file contents.
 #[derive(Debug, Error)]
 pub enum Error {

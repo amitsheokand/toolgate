@@ -1,0 +1,4 @@
+{
+  "deny": true,
+  "message": "denylist: rm recursive+force"
+}

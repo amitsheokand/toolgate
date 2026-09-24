@@ -1,0 +1,8 @@
+{
+  "tool": "read",
+  "input": {
+    "path": "big.txt"
+  },
+  "sessionId": "s",
+  "cwd": "/tmp/ws"
+}
