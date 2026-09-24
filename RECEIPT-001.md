@@ -17,13 +17,13 @@
 ## Gate output (tail)
 
 ```
-running 27 tests
-...........................
-test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+running 36 tests
+....................................
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
 
-running 20 tests
-....................
-test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+running 29 tests
+.............................
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
 ```
 
 (`cargo fmt --check` clean.)
@@ -48,3 +48,10 @@ toolgate v0.1.0
 ├── serde_json v1.0.151
 └── thiserror v2.0.21
 ```
+
+## Review round 2 (Grok NO-GO)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | Head/tail clip left incomplete UTF-8 at buffer ends (`char_boundary_at_or_before` no-op when `pos >= len`) | Trim continuation bytes and shrink until `from_utf8` succeeds; test 2/3/4-byte scalars with exact elided byte arithmetic and no U+FFFD |
+| 2 | `rules_verdict` ignored `Rules`; git deny looked at argv[1] only | Apply custom deny/allow prefixes (cargo/git/rg allow still uses guarded `allow_verdict`); skip git global options before push/reset deny; tests for `git -C … push --force`, `--no-pager push -f`, custom lists |

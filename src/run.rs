@@ -167,12 +167,15 @@ fn bytes_to_str(bytes: &[u8]) -> String {
 }
 
 fn char_boundary_at_or_before(bytes: &[u8], pos: usize) -> usize {
-    if pos >= bytes.len() {
-        return bytes.len();
-    }
-    let mut end = pos;
-    while end > 0 && is_utf8_continuation(bytes[end]) {
+    let mut end = pos.min(bytes.len());
+    while end > 0 && is_utf8_continuation(bytes[end - 1]) {
         end -= 1;
+    }
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+        while end > 0 && is_utf8_continuation(bytes[end - 1]) {
+            end -= 1;
+        }
     }
     end
 }
@@ -511,5 +514,57 @@ mod tests {
         c.push("ι".as_bytes());
         let s = c.finish();
         assert!(s.is_char_boundary(s.len()));
+    }
+
+    fn elided_count(output: &str) -> usize {
+        let rest = output.split("... [").nth(1).expect("elision marker");
+        let mid = rest.split("] ...").next().expect("elision close");
+        mid.strip_suffix(" bytes elided")
+            .expect("elided suffix")
+            .parse()
+            .expect("elided number")
+    }
+
+    fn assert_clip_no_fffd_and_elided(
+        head_cap: usize,
+        tail_cap: usize,
+        prefix: &str,
+        ch: char,
+        filler: &[u8],
+        suffix: &str,
+    ) {
+        assert!(!prefix.contains('\u{FFFD}'));
+        assert!(!suffix.contains('\u{FFFD}'));
+        let mut body = prefix.to_owned();
+        body.push(ch);
+        body.push_str(&"z".repeat(filler.len()));
+        body.push_str(suffix);
+        let total = body.as_bytes().len();
+        let mut c = StreamClipper::new(head_cap, tail_cap);
+        c.push(body.as_bytes());
+        let out = c.finish();
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "output had replacement char for scalar {ch:?}: {out:?}"
+        );
+        assert!(out.contains("bytes elided"));
+        let (head_part, tail_and_mid) = out.split_once("... [").expect("split head");
+        let (mid, tail_part) = tail_and_mid.split_once("] ...").expect("split tail");
+        let _ = mid;
+        let head_kept = head_part.as_bytes().len();
+        let tail_kept = tail_part.as_bytes().len();
+        assert_eq!(
+            elided_count(&out),
+            total - head_kept - tail_kept,
+            "elided byte count for {ch:?}"
+        );
+    }
+
+    #[test]
+    fn clipper_truncates_inside_multibyte_scalars_without_fffd() {
+        // Head cap ends inside the lead byte / continuation of 2-, 3-, and 4-byte UTF-8.
+        assert_clip_no_fffd_and_elided(3, 4, "aa", 'α', b"bbbbbbbbbb", "cc");
+        assert_clip_no_fffd_and_elided(3, 4, "aa", '中', b"bbbbbbbbbb", "cc");
+        assert_clip_no_fffd_and_elided(3, 4, "aa", '🎉', b"bbbbbbbbbb", "cc");
     }
 }

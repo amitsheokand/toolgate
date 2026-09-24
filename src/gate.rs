@@ -179,6 +179,98 @@ fn find_risky(args: &[String]) -> bool {
     })
 }
 
+fn skip_git_global_options(args: &[String]) -> usize {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-C" || a == "--work-tree" || a == "--namespace" {
+            i += 2;
+            continue;
+        }
+        if a == "--git-dir" {
+            i += 2;
+            continue;
+        }
+        if arg_is(a, "--git-dir") || arg_is(a, "--work-tree") || arg_is(a, "--namespace") {
+            i += 1;
+            continue;
+        }
+        if a.starts_with("-C") && a.len() > 2 {
+            i += 1;
+            continue;
+        }
+        if a == "-c" || a == "--config" || a == "--config-env" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("-c") && a.len() > 2 {
+            i += 1;
+            continue;
+        }
+        if arg_is(a, "--no-pager")
+            || arg_is(a, "--bare")
+            || a == "-P"
+            || a == "--no-replace-objects"
+        {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') && !a.starts_with("--") {
+            let mut j = i;
+            let rest = &a[1..];
+            let mut consumed = false;
+            for c in rest.chars() {
+                match c {
+                    'C' => {
+                        if j + 1 < args.len() {
+                            j += 2;
+                            consumed = true;
+                        }
+                    }
+                    'c' => {
+                        if j + 1 < args.len() {
+                            j += 2;
+                            consumed = true;
+                        }
+                    }
+                    'P' => {
+                        j += 1;
+                        consumed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if consumed && j > i {
+                i = j;
+                continue;
+            }
+        }
+        break;
+    }
+    i
+}
+
+fn git_subcommand_slice(args: &[String]) -> &[String] {
+    let off = skip_git_global_options(args);
+    args.get(off..).unwrap_or(&[])
+}
+
+fn argv_prefix_match(argv: &[String], prefix: &[String]) -> bool {
+    if argv.len() < prefix.len() {
+        return false;
+    }
+    for (i, p) in prefix.iter().enumerate() {
+        if i == 0 {
+            if program_basename(&argv[0]) != program_basename(p) {
+                return false;
+            }
+        } else if argv[i] != *p {
+            return false;
+        }
+    }
+    true
+}
+
 fn deny_verdict(argv: &[String]) -> Option<Verdict> {
     if argv.is_empty() {
         return None;
@@ -189,10 +281,11 @@ fn deny_verdict(argv: &[String]) -> Option<Verdict> {
         return Some(Verdict::Block("denylist: rm recursive+force".into()));
     }
     if prog == "git" {
-        if subcommand(args) == Some("push") && has_long_or_short(args, "--force", 'f') {
+        let git_cmd = git_subcommand_slice(args);
+        if subcommand(git_cmd) == Some("push") && has_long_or_short(git_cmd, "--force", 'f') {
             return Some(Verdict::Block("denylist: git push --force".into()));
         }
-        if subcommand(args) == Some("reset") && args.iter().any(|a| arg_is(a, "--hard")) {
+        if subcommand(git_cmd) == Some("reset") && git_cmd.iter().any(|a| arg_is(a, "--hard")) {
             return Some(Verdict::Block("denylist: git reset --hard".into()));
         }
     }
@@ -220,11 +313,12 @@ fn allow_verdict(argv: &[String]) -> Option<Verdict> {
             Some(Verdict::Allow)
         }
         "git" => {
-            let sub = subcommand(args)?;
+            let git_cmd = git_subcommand_slice(args);
+            let sub = subcommand(git_cmd)?;
             if !matches!(sub, "status" | "diff" | "log") {
                 return None;
             }
-            if has_git_config_injection(&args[1..]) {
+            if has_git_config_injection(args) {
                 return None;
             }
             Some(Verdict::Allow)
@@ -240,7 +334,21 @@ fn allow_verdict(argv: &[String]) -> Option<Verdict> {
 
 /// Deterministic verdict from [`Rules`], or `None` when Jev should judge.
 #[must_use]
-pub fn rules_verdict(argv: &[String], _rules: &Rules) -> Option<Verdict> {
+pub fn rules_verdict(argv: &[String], rules: &Rules) -> Option<Verdict> {
+    for prefix in &rules.deny {
+        if argv_prefix_match(argv, prefix) {
+            return Some(Verdict::Block(format!("denylist: {}", prefix.join(" "))));
+        }
+    }
+    for prefix in &rules.allow {
+        if argv_prefix_match(argv, prefix) {
+            let prog = program_basename(&argv.first().map(String::as_str).unwrap_or(""));
+            if matches!(prog, "cargo" | "git" | "rg") {
+                return allow_verdict(argv);
+            }
+            return Some(Verdict::Allow);
+        }
+    }
     deny_verdict(argv).or_else(|| allow_verdict(argv))
 }
 
@@ -546,6 +654,48 @@ mod tests {
         let rules = Rules::default();
         let argv = vec!["git".into(), "status".into()];
         assert!(matches!(rules_verdict(&argv, &rules), Some(Verdict::Allow)));
+    }
+
+    #[test]
+    fn rules_deny_git_push_force_after_global_options() {
+        let rules = Rules::default();
+        for argv in [
+            vec![
+                "git".into(),
+                "-C".into(),
+                "d".into(),
+                "push".into(),
+                "--force".into(),
+            ],
+            vec![
+                "git".into(),
+                "--no-pager".into(),
+                "push".into(),
+                "-f".into(),
+            ],
+        ] {
+            assert!(
+                matches!(rules_verdict(&argv, &rules), Some(Verdict::Block(_))),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_custom_allow_deny_lists() {
+        let rules = Rules {
+            allow: vec![vec!["echo".into()]],
+            deny: vec![vec!["wget".into()]],
+        };
+        assert!(matches!(
+            rules_verdict(&vec!["echo".into(), "hi".into()], &rules),
+            Some(Verdict::Allow)
+        ));
+        assert!(matches!(
+            rules_verdict(&vec!["wget".into(), "https://x".into()], &rules),
+            Some(Verdict::Block(_))
+        ));
+        assert!(rules_verdict(&vec!["curl".into(), "x".into()], &rules).is_none());
     }
 
     #[test]
