@@ -25,6 +25,7 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum HarnessCli {
+    Claude,
     Cursor,
     Muse,
     Opencode,
@@ -34,6 +35,7 @@ enum HarnessCli {
 impl From<HarnessCli> for toolgate::event::Harness {
     fn from(value: HarnessCli) -> Self {
         match value {
+            HarnessCli::Claude => Self::Claude,
             HarnessCli::Cursor => Self::Cursor,
             HarnessCli::Muse => Self::Muse,
             HarnessCli::Opencode => Self::Opencode,
@@ -89,7 +91,7 @@ enum Command {
     },
     /// Harness hooks (stdio JSON in/out).
     Hook {
-        /// Harness adapter (`cursor`, `muse`, `opencode`, `pi`).
+        /// Harness adapter (`claude`, `cursor`, `muse`, `opencode`, `pi`).
         #[arg(long, value_enum)]
         harness: Option<HarnessCli>,
         /// Hook event name (`preToolUse`, `postToolUse`, `PreToolUse`, …).

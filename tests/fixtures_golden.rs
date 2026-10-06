@@ -39,6 +39,7 @@ fn fixture_dir(harness: &str) -> PathBuf {
 
 fn run_case(harness: Harness, event: &str, stem: &str, home: &PathBuf, cwd: Option<&str>) {
     let dir = fixture_dir(match harness {
+        Harness::Claude => "claude",
         Harness::Cursor => "cursor",
         Harness::Muse => "muse",
         Harness::Opencode => "opencode",
@@ -163,6 +164,36 @@ fn cursor_big_mcp_output_clips() {
         Harness::Cursor,
         "postToolUse",
         "big_mcp_output",
+        &home,
+        None,
+    );
+}
+
+#[test]
+fn claude_matrix() {
+    let (tmp, home) = big_file_workspace();
+    run_case(
+        Harness::Claude,
+        "PreToolUse",
+        "read_over_limit",
+        &home,
+        Some(tmp.path().to_str().unwrap()),
+    );
+    run_case(Harness::Claude, "PreToolUse", "bounded_read", &home, None);
+    run_case(Harness::Claude, "PreToolUse", "small_read", &home, None);
+    run_case(Harness::Claude, "PreToolUse", "shell_deny", &home, None);
+    run_case(Harness::Claude, "PreToolUse", "unknown_payload", &home, None);
+    run_case(
+        Harness::Claude,
+        "PostToolUse",
+        "big_mcp_output",
+        &home,
+        None,
+    );
+    run_case(
+        Harness::Claude,
+        "PostToolUse",
+        "big_shell_output",
         &home,
         None,
     );

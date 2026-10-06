@@ -7,6 +7,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
+    Claude,
     Cursor,
     Muse,
     Opencode,
@@ -17,6 +18,7 @@ impl Harness {
     #[must_use]
     pub fn file_stem(self) -> &'static str {
         match self {
+            Self::Claude => "claude",
             Self::Cursor => "cursor",
             Self::Muse => "muse",
             Self::Opencode => "opencode",

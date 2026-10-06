@@ -43,8 +43,8 @@ in
     harnesses = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [
+        "claude"
         "cursor"
-        "muse"
         "opencode"
         "pi"
       ];
@@ -142,6 +142,39 @@ in
         )}
         mkdir -p "$HOME/.config/muse"
         ${mergeHooks} "$HOME/.config/muse/settings.json" "$muse_patch"
+
+        claude_patch=${pkgs.writeText "toolgate-claude-hooks.json" (
+          if hasHarness "claude" then
+            builtins.toJSON {
+              hooks = {
+                PreToolUse = [
+                  {
+                    matcher = "Read|Grep|Glob|Bash";
+                    hooks = [
+                      {
+                        type = "command";
+                        command = "${toolgateBin} hook --harness claude --event PreToolUse";
+                      }
+                    ];
+                  }
+                ];
+                PostToolUse = [
+                  {
+                    matcher = "Bash|mcp__.*";
+                    hooks = [
+                      {
+                        type = "command";
+                        command = "${toolgateBin} hook --harness claude --event PostToolUse";
+                      }
+                    ];
+                  }
+                ];
+              };
+            }
+          else
+            builtins.toJSON { hooks = { }; }
+        )}
+        ${mergeHooks} "$HOME/.claude/settings.json" "$claude_patch"
       '';
     }
   ]);

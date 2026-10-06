@@ -2,6 +2,7 @@
 //!
 //! See per-harness module docs for payload sources.
 
+mod claude;
 mod cursor;
 mod muse;
 mod opencode;
@@ -21,6 +22,7 @@ pub use pi::PiReply;
 #[must_use]
 pub fn parse_event(harness: Harness, event_name: &str, value: &Value) -> ToolEvent {
     match harness {
+        Harness::Claude => claude::parse(event_name, value),
         Harness::Cursor => cursor::parse(event_name, value),
         Harness::Muse => muse::parse(event_name, value),
         Harness::Opencode => opencode::parse(event_name, value),
@@ -32,6 +34,7 @@ pub fn parse_event(harness: Harness, event_name: &str, value: &Value) -> ToolEve
 #[must_use]
 pub fn render_reply(harness: Harness, event_name: &str, outcome: &PolicyOutcome) -> Value {
     match harness {
+        Harness::Claude => claude::render(event_name, outcome),
         Harness::Cursor => cursor::render(event_name, outcome),
         Harness::Muse => muse::render(event_name, outcome),
         Harness::Opencode => opencode::render(event_name, outcome),
