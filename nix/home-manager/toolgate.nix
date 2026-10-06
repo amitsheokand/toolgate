@@ -16,7 +16,7 @@ let
     pkgs.replaceVars src {
       TOOLGATE_BIN = toolgateBin;
     };
-  opencodeHook = substituteHook ../../adapters/opencode/toolgate-hook.mjs;
+  opencodeHook = substituteHook ../../adapters/opencode/toolgate-hook.js;
   piHook = substituteHook ../../adapters/pi/toolgate-hook.ts;
   hasHarness = h: lib.elem h cfg.harnesses;
 in
@@ -65,7 +65,7 @@ in
       home.packages = [ cfg.package ];
     }
     (lib.mkIf (hasHarness "opencode") {
-      xdg.configFile."opencode/plugins/toolgate-hook.mjs".source = opencodeHook;
+      xdg.configFile."opencode/plugins/toolgate-hook.js".source = opencodeHook;
     })
     (lib.mkIf (hasHarness "pi") {
       home.file.".pi/agent/extensions/toolgate-hook.ts".source = piHook;
