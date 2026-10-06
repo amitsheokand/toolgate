@@ -8,7 +8,7 @@ let
     pkgs.replaceVars src {
       TOOLGATE_BIN = toolgateBin;
     };
-  opencodeHook = substituteHook ../../adapters/opencode/toolgate-hook.mjs;
+  opencodeHook = substituteHook ../../adapters/opencode/toolgate-hook.js;
   piHook = substituteHook ../../adapters/pi/toolgate-hook.ts;
   mergeHooks = import ../home-manager/merge-hooks.nix {
     inherit pkgs;

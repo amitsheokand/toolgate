@@ -1,7 +1,7 @@
-#!/usr/bin/env node
 /**
  * OpenCode plugin: forwards tool.execute.before/after to `toolgate hook --harness opencode`.
- * No policy logic here.
+ * No policy logic here. The file must end in .ts or .js: OpenCode loads
+ * {plugin,plugins}/*.{ts,js} and silently skips .mjs.
  */
 import { spawnSync } from "node:child_process";
 
