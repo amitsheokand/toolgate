@@ -228,7 +228,9 @@ fn decide_post(event: &ToolEvent, policy: &Policy, archive_dir: Option<&Path>) -
 fn shell_post_clip_enabled(harness: crate::event::Harness) -> bool {
     matches!(
         harness,
-        crate::event::Harness::Opencode | crate::event::Harness::Pi
+        crate::event::Harness::Claude
+            | crate::event::Harness::Opencode
+            | crate::event::Harness::Pi
     )
 }
 

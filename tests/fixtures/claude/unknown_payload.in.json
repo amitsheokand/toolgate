@@ -1,0 +1,7 @@
+{
+  "tool_name": "CustomWidget",
+  "tool_input": {
+    "foo": 1
+  },
+  "cwd": "/tmp/ws"
+}
