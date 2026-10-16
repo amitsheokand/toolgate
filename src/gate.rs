@@ -11,6 +11,7 @@
 
 #[cfg(feature = "jev")]
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "jev")]
 use serde::Deserialize;
@@ -391,12 +392,159 @@ fn argv_prefix_match(argv: &[String], prefix: &[String]) -> bool {
     true
 }
 
-fn builtin_deny_on_normalized(norm: &[String]) -> Option<Verdict> {
+/// `nix` as the program, or behind leading `NAME=value` words. The shell
+/// splitter does not strip env prefixes, so `NIX_CONFIG=... nix build` arrives
+/// as `["NIX_CONFIG=...", "nix", "build", ...]`.
+fn is_nix_invocation(norm: &[String]) -> bool {
+    program_basename(&norm[0]) == "nix"
+        || (norm[0].contains('=') && norm.iter().any(|a| program_basename(a) == "nix"))
+}
+
+/// Path part of a `path:` or `git+file:` flake ref, without `?query` or `#attr`.
+fn flake_ref_path(piece: &str) -> Option<&str> {
+    let rest = piece
+        .strip_prefix("git+file:")
+        .or_else(|| piece.strip_prefix("path:"))?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    Some(rest.split(['?', '#']).next().unwrap_or(rest))
+}
+
+/// Non-empty segments with `.` dropped and `..` applied lexically.
+fn lexical_segments(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    out
+}
+
+/// Under `~/work/advait`, `$HOME/work/advait`, `${HOME}/work/advait`,
+/// `/home/<user>/work/advait`, or the `$HOME` env value's `work/advait`.
+fn is_primary_checkout(segs: &[&str], home_segs: &[&str]) -> bool {
+    let rest = match segs {
+        ["~" | "$HOME" | "${HOME}", rest @ ..] => rest,
+        ["home", _, rest @ ..] => rest,
+        _ if !home_segs.is_empty() && segs.starts_with(home_segs) => &segs[home_segs.len()..],
+        _ => return false,
+    };
+    rest.starts_with(&["work", "advait"])
+}
+
+/// Whether one flake-ref path points at the primary checkout or at a git
+/// checkout root other than the gate root. Relative paths resolve against
+/// `root`. The primary checkout is matched lexically and after symlinks are
+/// resolved. Other paths are denied only when they resolve to a directory
+/// with a `.git` entry that is not `root` itself. Missing paths, small
+/// tracked subdirectories, and `root` are not denied.
+fn flake_path_hits_checkout(p: &str, root: &str, home_segs: &[&str], canon_root: &Path) -> bool {
+    let joined = if p.starts_with(|c: char| matches!(c, '/' | '~' | '$')) {
+        p.to_owned()
+    } else {
+        format!("{root}/{p}")
+    };
+    if is_primary_checkout(&lexical_segments(&joined), home_segs) {
+        return true;
+    }
+    let Ok(real) = Path::new(&joined).canonicalize() else {
+        return false;
+    };
+    let real_str = real.to_string_lossy();
+    if is_primary_checkout(&lexical_segments(&real_str), home_segs) {
+        return true;
+    }
+    real.join(".git").exists() && real.as_path() != canon_root
+}
+
+/// Deny rule for `nix run|build|develop|shell` with a `path:` or `git+file:`
+/// flake ref (argument or `--override-input <name> <value>`) that points at a
+/// git checkout: [`flake_path_hits_checkout`]. `git+ssh:` and other refs are
+/// not checked.
+fn nix_flake_ref_hits_checkout(norm: &[String], root: &str) -> bool {
+    let args = &norm[1..];
+    if !args
+        .iter()
+        .any(|a| matches!(a.as_str(), "run" | "build" | "develop" | "shell"))
+    {
+        return false;
+    }
+    let home = std::env::var("HOME").ok();
+    let home_segs = home.as_deref().map(lexical_segments).unwrap_or_default();
+    let canon_root = Path::new(root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root));
+    norm.iter().any(|arg| {
+        // Split on `=` as well, so `--override-input=platform=path:...` also matches.
+        arg.split('=').any(|piece| {
+            flake_ref_path(piece)
+                .is_some_and(|p| flake_path_hits_checkout(p, root, &home_segs, &canon_root))
+        })
+    })
+}
+
+/// Whitespace words of every argv element, with each `=` as its own word, so
+/// `min-free = 0`, `min-free=0`, and `--option min-free 0` all split the same way.
+fn setting_words(norm: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for arg in norm {
+        for word in arg.split_whitespace() {
+            for (j, part) in word.split('=').enumerate() {
+                if j > 0 {
+                    out.push("=");
+                }
+                if !part.is_empty() {
+                    out.push(part);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether any `min-free` setting is `0`: `--option min-free 0`, `--option
+/// min-free=0`, `--min-free 0`, `--min-free=0`, or `min-free = 0` (also inside
+/// `NIX_CONFIG=` prefix words). A bare `min-free 0` word pair without
+/// `--option` or `=` does not count.
+fn nix_min_free_zero(norm: &[String]) -> bool {
+    let words = setting_words(norm);
+    (0..words.len()).any(|i| {
+        if words[i] != "min-free" && words[i] != "--min-free" {
+            return false;
+        }
+        let eq = words.get(i + 1) == Some(&"=");
+        let value = if eq {
+            words.get(i + 2)
+        } else {
+            words.get(i + 1)
+        };
+        value == Some(&"0")
+            && (eq || words[i].starts_with("--") || (i > 0 && words[i - 1] == "--option"))
+    })
+}
+
+fn builtin_deny_on_normalized(norm: &[String], root: &str) -> Option<Verdict> {
     if norm.is_empty() {
         return None;
     }
     let prog = program_basename(&norm[0]);
     let args = &norm[1..];
+    if is_nix_invocation(norm) {
+        if nix_flake_ref_hits_checkout(norm, root) {
+            return Some(Verdict::Block(
+                "denylist: nix path:/git+file: flake ref to a git checkout; pin by rev, e.g. git+ssh://git@gitlab.com/advait-os/advait?ref=main&rev=<sha>&submodules=1, and run the devshell from your own packet tree".into(),
+            ));
+        }
+        if nix_min_free_zero(norm) {
+            return Some(Verdict::Block(
+                "denylist: nix min-free 0 disables the low-disk safety".into(),
+            ));
+        }
+    }
     if prog == "rm" && has_rm_recursive_force(args) {
         return Some(Verdict::Block("denylist: rm recursive+force".into()));
     }
@@ -421,9 +569,9 @@ fn builtin_deny_on_normalized(norm: &[String]) -> Option<Verdict> {
     None
 }
 
-fn hard_deny(argv: &[String], rules: &Rules) -> Option<Verdict> {
+fn hard_deny(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
     let norm = normalized_argv(argv);
-    if let Some(v) = builtin_deny_on_normalized(&norm) {
+    if let Some(v) = builtin_deny_on_normalized(&norm, root) {
         return Some(v);
     }
     for prefix in &rules.deny {
@@ -753,7 +901,7 @@ fn hard_allow(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
 /// Deterministic verdict from [`Rules`], or `None` when Jev should judge.
 #[must_use]
 pub fn rules_verdict(argv: &[String], rules: &Rules, root: &str) -> Option<Verdict> {
-    if let Some(v) = hard_deny(argv, rules) {
+    if let Some(v) = hard_deny(argv, rules, root) {
         return Some(v);
     }
     hard_allow(argv, rules, root)
@@ -1256,6 +1404,183 @@ mod tests {
             rules_verdict(&argv, &rules, test_root()),
             Some(Verdict::Block(_))
         ));
+    }
+
+    /// Whitespace-split command line; the cases below have no quoting.
+    fn words(cmd: &str) -> Vec<String> {
+        cmd.split_whitespace().map(String::from).collect()
+    }
+
+    /// `<tmp>/packet` is the gate root and a checkout (`.git` file),
+    /// `<tmp>/other` is a checkout root, `<tmp>/platform-stub` is a tracked
+    /// subdirectory with no `.git`.
+    fn nix_ref_fixture(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("toolgate-nix-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["packet/launch/minimal", "other/.git", "platform-stub"] {
+            std::fs::create_dir_all(base.join(d)).expect("fixture dir");
+        }
+        std::fs::write(base.join("packet/.git"), "gitdir: ../other/.git\n").expect("packet .git");
+        std::fs::write(base.join("platform-stub/flake.nix"), "{}").expect("stub flake");
+        base
+    }
+
+    #[test]
+    fn nix_primary_checkout_flake_refs_denied() {
+        let rules = Rules::default();
+        for cmd in [
+            "nix run ./launch/minimal --override-input platform path:/home/u/work/advait -- editor",
+            "nix develop git+file:///home/u/work/advait?submodules=1#pe",
+            "nix develop git+file:/home/u/work/advait#pe",
+            "nix build --override-input platform path:~/work/advait .#x",
+            "nix build --override-input platform path:$HOME/work/advait .#x",
+            "nix build --override-input platform path:${HOME}/work/advait .#x",
+            "nix shell path:/home/u/work/advait#pe",
+            "nix build --override-input platform path:/home/u/work/worktrees/../advait .#x",
+            "nix build --override-input=platform=path:/home/u/work/advait .#x",
+            "NIX_CONFIG=x nix build --override-input platform path:/home/u/work/advait .#x",
+        ] {
+            assert!(
+                matches!(
+                    rules_verdict(&words(cmd), &rules, test_root()),
+                    Some(Verdict::Block(_))
+                ),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_checkout_root_refs_denied_except_gate_root() {
+        let rules = Rules::default();
+        let base = nix_ref_fixture("checkout");
+        let root = base.join("packet").display().to_string();
+        let other = base.join("other").display().to_string();
+        let stub = base.join("platform-stub").display().to_string();
+        for cmd in [
+            format!("nix build --override-input platform path:{other} .#x"),
+            format!("nix build --override-input platform git+file://{other}?submodules=1 .#x"),
+        ] {
+            assert!(
+                matches!(
+                    rules_verdict(&words(&cmd), &rules, &root),
+                    Some(Verdict::Block(_))
+                ),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            format!("nix build --override-input platform path:{root} .#x"),
+            "nix build --override-input platform path:. .#x".to_owned(),
+            format!("nix build --override-input platform path:{stub} .#x"),
+            "nix run ./launch/minimal --override-input platform path:../platform-stub".to_owned(),
+        ] {
+            assert!(
+                rules_verdict(&words(&cmd), &rules, &root).is_none(),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nix_checkout_root_through_symlink_denied() {
+        let rules = Rules::default();
+        let base = nix_ref_fixture("symlink");
+        let root = base.join("packet").display().to_string();
+        std::os::unix::fs::symlink(base.join("other"), base.join("link")).expect("symlink");
+        let cmd = format!(
+            "nix build --override-input platform path:{} .#x",
+            base.join("link").display()
+        );
+        assert!(
+            matches!(
+                rules_verdict(&words(&cmd), &rules, &root),
+                Some(Verdict::Block(_))
+            ),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn nix_git_ssh_pinned_ref_allowed() {
+        let rules = Rules::default();
+        let cmd = r#"nix build --override-input platform "git+ssh://git@gitlab.com/advait-os/advait?ref=main&rev=abc&submodules=1" .#x"#;
+        assert!(
+            rules_verdict(&words(cmd), &rules, test_root()).is_none(),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn nix_min_free_zero_denied() {
+        let rules = Rules::default();
+        for cmd in [
+            "nix build --option min-free 0 .#x",
+            "nix build --option min-free=0 .#x",
+            "nix build --option min-free = 0 .#x",
+            "nix build --min-free 0 .#x",
+            "nix build --min-free=0 .#x",
+            "NIX_CONFIG=min-free=0 nix build .#x",
+        ] {
+            assert!(
+                matches!(
+                    rules_verdict(&words(cmd), &rules, test_root()),
+                    Some(Verdict::Block(_))
+                ),
+                "{cmd}"
+            );
+        }
+        // `NIX_CONFIG='min-free = 0' nix build .#x` as the shell splitter emits it.
+        let quoted = vec![
+            "NIX_CONFIG=min-free = 0".to_owned(),
+            "nix".into(),
+            "build".into(),
+            ".#x".into(),
+        ];
+        assert!(matches!(
+            rules_verdict(&quoted, &rules, test_root()),
+            Some(Verdict::Block(_))
+        ));
+    }
+
+    #[test]
+    fn nix_min_free_nonzero_and_non_nix_allowed() {
+        let rules = Rules::default();
+        for cmd in [
+            "nix build --option min-free 1073741824 .#x",
+            "echo --option min-free 0",
+        ] {
+            assert!(
+                rules_verdict(&words(cmd), &rules, test_root()).is_none(),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_deny_verdict_text() {
+        let rules = Rules::default();
+        assert_eq!(
+            rules_verdict(
+                &words("nix develop git+file:///home/u/work/advait?submodules=1#pe"),
+                &rules,
+                test_root()
+            ),
+            Some(Verdict::Block(
+                "denylist: nix path:/git+file: flake ref to a git checkout; pin by rev, e.g. git+ssh://git@gitlab.com/advait-os/advait?ref=main&rev=<sha>&submodules=1, and run the devshell from your own packet tree".into()
+            ))
+        );
+        assert_eq!(
+            rules_verdict(
+                &words("nix build --option min-free 0 .#x"),
+                &rules,
+                test_root()
+            ),
+            Some(Verdict::Block(
+                "denylist: nix min-free 0 disables the low-disk safety".into()
+            ))
+        );
     }
 
     #[test]
