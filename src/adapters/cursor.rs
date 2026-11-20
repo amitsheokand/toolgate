@@ -137,10 +137,11 @@ fn normalize_args(value: &Value, tool: &ToolKind) -> NormalizedArgs {
     if let Some(cmd) = value.get("command").and_then(Value::as_str) {
         args.command = Some(cmd.to_owned());
     }
-    let input = value
-        .get("tool_input")
-        .cloned()
-        .or_else(|| value.get("tool_input").cloned());
+    let input = value.get("tool_input").and_then(|input| match input {
+        Value::Object(_) => Some(input.clone()),
+        Value::String(json) => serde_json::from_str::<Value>(json).ok(),
+        _ => None,
+    });
     if let Some(obj) = input.and_then(|v| v.as_object().cloned()) {
         args.raw_input = Some(Value::Object(obj.clone()));
         args.path = string_field(&obj, &["path", "file_path", "target_file"]);
@@ -215,7 +216,58 @@ fn post_replace(event_name: &str, text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Decision, PolicyOutcome};
+    use crate::policy::{Decision, Policy, PolicyOutcome, decide};
+
+    #[test]
+    fn cursor_pre_tool_use_read_window_payload_enforces_whole_file_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = (1..=3507)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(tmp.path().join("large.rs"), body).expect("write large file");
+        let cwd = tmp.path().to_string_lossy();
+
+        let windowed = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Read",
+            "tool_input": "{\"path\":\"large.rs\",\"offset\":1285,\"limit\":90}",
+            "cwd": cwd.as_ref(),
+        });
+        let windowed = parse("preToolUse", &windowed);
+        assert_eq!(windowed.args.offset, Some(1285));
+        assert_eq!(windowed.args.limit, Some(90));
+        assert!(matches!(
+            decide(&windowed, &Policy::default(), None).applied,
+            Decision::Allow
+        ));
+
+        let whole_file = json!({
+            "hook_event_name": "preToolUse",
+            "tool_name": "Read",
+            "tool_input": "{\"path\":\"large.rs\"}",
+            "cwd": cwd.as_ref(),
+        });
+        let whole_file = parse("preToolUse", &whole_file);
+        assert!(matches!(
+            decide(&whole_file, &Policy::default(), None).applied,
+            Decision::Deny { rule_id, .. } if rule_id == "read.whole_file_cap"
+        ));
+
+        let claude_payload = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "large.rs", "offset": 1285, "limit": 90},
+            "cwd": cwd.as_ref(),
+        });
+        let claude = crate::adapters::claude::parse("PreToolUse", &claude_payload);
+        assert_eq!(claude.args.path.as_deref(), Some("large.rs"));
+        assert_eq!(claude.args.offset, Some(1285));
+        assert_eq!(claude.args.limit, Some(90));
+        assert!(matches!(
+            decide(&claude, &Policy::default(), None).applied,
+            Decision::Allow
+        ));
+    }
 
     #[test]
     fn after_mcp_execution_classifies_as_mcp() {
