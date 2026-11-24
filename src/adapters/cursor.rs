@@ -219,7 +219,7 @@ mod tests {
     use crate::policy::{Decision, Policy, PolicyOutcome, decide};
 
     #[test]
-    fn cursor_pre_tool_use_read_window_payload_enforces_whole_file_cap() {
+    fn cursor_pre_tool_use_read_is_not_capped_claude_whole_file_is() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let body = (1..=3507)
             .map(|line| format!("line {line}"))
@@ -242,15 +242,28 @@ mod tests {
             Decision::Allow
         ));
 
-        let whole_file = json!({
+        // Recorded shape: Cursor sends this both for a windowed Read and before StrReplace.
+        let bare = json!({
             "hook_event_name": "preToolUse",
             "tool_name": "Read",
-            "tool_input": "{\"path\":\"large.rs\"}",
+            "tool_input": {"file_path": "large.rs"},
             "cwd": cwd.as_ref(),
         });
-        let whole_file = parse("preToolUse", &whole_file);
+        let bare = parse("preToolUse", &bare);
+        assert_eq!(bare.args.path.as_deref(), Some("large.rs"));
         assert!(matches!(
-            decide(&whole_file, &Policy::default(), None).applied,
+            decide(&bare, &Policy::default(), None).applied,
+            Decision::Allow
+        ));
+
+        let claude_whole = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "large.rs"},
+            "cwd": cwd.as_ref(),
+        });
+        let claude_whole = crate::adapters::claude::parse("PreToolUse", &claude_whole);
+        assert!(matches!(
+            decide(&claude_whole, &Policy::default(), None).applied,
             Decision::Deny { rule_id, .. } if rule_id == "read.whole_file_cap"
         ));
 

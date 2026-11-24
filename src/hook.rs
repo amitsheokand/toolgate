@@ -364,6 +364,20 @@ mod tests {
             format!(r#"{{"tool_name":"Read","tool_input":{{"path":"big.txt"}},"cwd":"{cwd}"}}"#);
         let mut out = Vec::new();
         hook_stdio_with(
+            Harness::Claude,
+            "PreToolUse",
+            input.as_bytes(),
+            &mut out,
+            &env,
+        )
+        .expect("stdio");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("deny"), "{text}");
+        assert!(text.contains("whole-file reads"), "{text}");
+
+        // Cursor cannot tell a windowed read or an edit from a whole-file read at pre.
+        let mut out = Vec::new();
+        hook_stdio_with(
             Harness::Cursor,
             "preToolUse",
             input.as_bytes(),
@@ -372,7 +386,7 @@ mod tests {
         )
         .expect("stdio");
         let parsed: Value = serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
-        assert_eq!(parsed["permission"], "deny");
+        assert_eq!(parsed["permission"], "allow");
     }
 
     #[test]

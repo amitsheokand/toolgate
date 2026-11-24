@@ -97,8 +97,9 @@ fn big_file_workspace() -> (tempfile::TempDir, PathBuf) {
     (tmp, home)
 }
 
+// Cursor pre payloads carry no window, so the cap is not judged at pre (see policy::read_pre).
 #[test]
-fn cursor_read_over_limit_denies() {
+fn cursor_read_over_limit_allows_at_pre() {
     let (tmp, home) = big_file_workspace();
     run_case(
         Harness::Cursor,
@@ -182,7 +183,13 @@ fn claude_matrix() {
     run_case(Harness::Claude, "PreToolUse", "bounded_read", &home, None);
     run_case(Harness::Claude, "PreToolUse", "small_read", &home, None);
     run_case(Harness::Claude, "PreToolUse", "shell_deny", &home, None);
-    run_case(Harness::Claude, "PreToolUse", "unknown_payload", &home, None);
+    run_case(
+        Harness::Claude,
+        "PreToolUse",
+        "unknown_payload",
+        &home,
+        None,
+    );
     run_case(
         Harness::Claude,
         "PostToolUse",

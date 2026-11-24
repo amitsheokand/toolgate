@@ -228,13 +228,17 @@ fn decide_post(event: &ToolEvent, policy: &Policy, archive_dir: Option<&Path>) -
 fn shell_post_clip_enabled(harness: crate::event::Harness) -> bool {
     matches!(
         harness,
-        crate::event::Harness::Claude
-            | crate::event::Harness::Opencode
-            | crate::event::Harness::Pi
+        crate::event::Harness::Claude | crate::event::Harness::Opencode | crate::event::Harness::Pi
     )
 }
 
 fn read_pre(event: &ToolEvent, policy: &Policy) -> Decision {
+    // Cursor drops offset/limit from the preToolUse payload and also fires a bare
+    // `Read {file_path}` before StrReplace, so a windowed read, an edit and a whole-file
+    // read look the same here. The cap cannot be judged at pre for this harness.
+    if event.harness == crate::event::Harness::Cursor {
+        return Decision::Allow;
+    }
     if event.args.offset.is_some() || event.args.limit.is_some() {
         return Decision::Allow;
     }
