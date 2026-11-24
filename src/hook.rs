@@ -258,6 +258,11 @@ where
 }
 
 fn run_hook(harness: Harness, event_name: &str, value: &Value, env: &HookEnv) -> Value {
+    // Cursor also runs the hooks in Claude's settings file, with its own payload. Its own
+    // hooks.json entry already judged this event; a second verdict under Claude rules is wrong.
+    if harness == Harness::Claude && value.get("cursor_version").is_some() {
+        return adapters::allow_reply(harness, event_name);
+    }
     let mut policy = load_policy_file(&env.paths.policy_file);
     policy.mode = resolve_mode(&policy, env.policy_override.as_deref());
     let event = adapters::parse_event(harness, event_name, value);
@@ -387,6 +392,55 @@ mod tests {
         .expect("stdio");
         let parsed: Value = serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
         assert_eq!(parsed["permission"], "allow");
+    }
+
+    #[test]
+    fn claude_hook_skips_cursor_origin_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = (1..=900)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("big.txt"), body).expect("write");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".config/toolgate")).expect("cfg");
+        let env = HookEnv {
+            paths: HookPaths::from_home(&home),
+            policy_override: None,
+            telemetry_enabled: false,
+            record_dir: None,
+        };
+        let cwd = dir.path().to_string_lossy();
+        // Key set recorded from Cursor running the Claude settings hook (values replaced).
+        let from_cursor = format!(
+            r#"{{"conversation_id":"c","cursor_version":"2026.10.16","generation_id":"g","hook_event_name":"preToolUse","model":"m","session_id":"s","tool_input":{{"file_path":"{cwd}/big.txt"}},"tool_name":"Read","tool_use_id":"t","workspace_roots":["{cwd}"]}}"#
+        );
+        let mut out = Vec::new();
+        hook_stdio_with(
+            Harness::Claude,
+            "PreToolUse",
+            from_cursor.as_bytes(),
+            &mut out,
+            &env,
+        )
+        .expect("stdio");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("deny"), "{text}");
+
+        let from_claude = format!(
+            r#"{{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{{"file_path":"{cwd}/big.txt"}},"cwd":"{cwd}"}}"#
+        );
+        let mut out = Vec::new();
+        hook_stdio_with(
+            Harness::Claude,
+            "PreToolUse",
+            from_claude.as_bytes(),
+            &mut out,
+            &env,
+        )
+        .expect("stdio");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("deny"), "{text}");
     }
 
     #[test]
