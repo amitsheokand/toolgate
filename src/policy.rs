@@ -492,6 +492,28 @@ mod tests {
     }
 
     #[test]
+    fn shell_deny_wt_no_hooks_from_a_command_string() {
+        let policy = Policy::default();
+        for (cmd, denied) in [
+            ("wt -C '/w/my repo' remove --no-hooks", true),
+            ("cd /w/repo &&\nwt remove --no-verify row-x", true),
+            ("bash -c 'wt merge --no-hooks'", true),
+            ("wt remove --foreground row-x", false),
+        ] {
+            let event = ev(
+                ToolKind::Shell,
+                Phase::Pre,
+                NormalizedArgs {
+                    command: Some(cmd.into()),
+                    ..Default::default()
+                },
+            );
+            let out = decide(&event, &policy, None);
+            assert_eq!(matches!(out.raw, Decision::Deny { .. }), denied, "{cmd}");
+        }
+    }
+
+    #[test]
     fn telemetry_digest_paths_no_raw_in_policy() {
         let policy = Policy::default();
         let event = ev(

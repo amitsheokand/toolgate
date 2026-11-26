@@ -527,6 +527,131 @@ fn nix_min_free_zero(norm: &[String]) -> bool {
     })
 }
 
+fn is_shell_operator(c: char) -> bool {
+    matches!(c, ';' | '&' | '|' | '(' | ')')
+}
+
+/// Simple commands of an argv: split at shell operators, also when glued to a
+/// word (`x;wt`). A quoted argument stays one word, except the script of a
+/// shell's `-c`, which is split on whitespace.
+fn shell_segments(argv: &[String]) -> Vec<Vec<String>> {
+    let mut words: Vec<&str> = Vec::new();
+    let mut shell_seen = false;
+    let mut script_next = false;
+    for arg in argv {
+        if script_next {
+            for line in arg.lines() {
+                words.extend(line.split_whitespace());
+                words.push(";");
+            }
+            script_next = false;
+            continue;
+        }
+        if matches!(program_basename(arg), "bash" | "sh" | "zsh") {
+            shell_seen = true;
+        } else if shell_seen && arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c')
+        {
+            script_next = true;
+            shell_seen = false;
+        }
+        words.push(arg);
+    }
+    let mut out = vec![Vec::new()];
+    for word in words {
+        for (i, piece) in word.split(is_shell_operator).enumerate() {
+            if i > 0 {
+                out.push(Vec::new());
+            }
+            if !piece.is_empty() {
+                if let Some(last) = out.last_mut() {
+                    last.push(piece.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Environment assignments that replace the user config holding wt's hooks.
+fn wt_config_env(word: &str) -> Option<&'static str> {
+    let (name, _) = word.split_once('=')?;
+    match name {
+        "WORKTRUNK_CONFIG_PATH" => Some("WORKTRUNK_CONFIG_PATH="),
+        "WORKTRUNK_SYSTEM_CONFIG_PATH" => Some("WORKTRUNK_SYSTEM_CONFIG_PATH="),
+        "XDG_CONFIG_HOME" => Some("XDG_CONFIG_HOME="),
+        "HOME" => Some("HOME="),
+        _ if name.starts_with("WORKTRUNK__PRE_") => Some("WORKTRUNK__PRE_*="),
+        _ => None,
+    }
+}
+
+/// `wt remove`, `wt merge`, `wt step prune` or `wt switch` run in a way that
+/// skips or replaces the user hooks (`pre-remove` guard, tree name check):
+/// `--no-hooks`, its hidden alias `--no-verify`, `--config`, `--config-set`, or a
+/// config environment override. Returns the subcommand and what bypasses.
+/// Text match only: wt aliases, scripts and variables are not expanded.
+fn wt_guard_bypass(argv: &[String]) -> Option<(&'static str, &'static str)> {
+    // `export WORKTRUNK_CONFIG_PATH=x; wt remove` reaches a later segment.
+    let mut exported = None;
+    for segment in shell_segments(argv) {
+        if segment.first().is_some_and(|w| w == "export") {
+            exported = exported.or_else(|| {
+                segment
+                    .iter()
+                    .find_map(|w| wt_config_env(w).filter(|e| e.starts_with("WORKTRUNK")))
+            });
+            continue;
+        }
+        let Some(at) = segment
+            .iter()
+            .position(|w| matches!(program_basename(w), "wt" | "git-wt"))
+        else {
+            continue;
+        };
+        let mut env = segment[..at]
+            .iter()
+            .find_map(|w| wt_config_env(w))
+            .or(exported);
+        let mut config = None;
+        let mut skip = None;
+        let mut plain = Vec::new();
+        let mut rest = segment[at + 1..].iter().map(String::as_str);
+        while let Some(word) = rest.next() {
+            match word {
+                "--" => break,
+                "--no-hooks" => skip = Some("--no-hooks"),
+                "--no-verify" => skip = Some("--no-verify"),
+                "--config" => {
+                    config = Some("--config");
+                    rest.next();
+                }
+                "--config-set" => {
+                    config = Some("--config-set");
+                    rest.next();
+                }
+                "-C" => {
+                    rest.next();
+                }
+                _ if word.starts_with("--config=") => config = Some("--config"),
+                _ if word.starts_with("--config-set=") => config = Some("--config-set"),
+                _ if word.starts_with('-') => {}
+                _ => plain.push(word),
+            }
+        }
+        let sub = match plain.as_slice() {
+            ["remove", ..] => "remove",
+            ["merge", ..] => "merge",
+            ["switch", ..] => "switch",
+            ["step", "prune", ..] => "step prune",
+            _ => continue,
+        };
+        if let Some(what) = skip.or(config).or_else(|| env.take()) {
+            return Some((sub, what));
+        }
+    }
+    None
+}
+
 fn builtin_deny_on_normalized(norm: &[String], root: &str) -> Option<Verdict> {
     if norm.is_empty() {
         return None;
@@ -547,6 +672,13 @@ fn builtin_deny_on_normalized(norm: &[String], root: &str) -> Option<Verdict> {
     }
     if prog == "rm" && has_rm_recursive_force(args) {
         return Some(Verdict::Block("denylist: rm recursive+force".into()));
+    }
+    if let Some((sub, what)) = wt_guard_bypass(norm) {
+        return Some(Verdict::Block(format!(
+            "denylist: wt {sub} with {what} skips the worktree guard (a dirty or unpushed tree \
+             can be dropped, or a used tree name reused). Run it without {what}; if the guard \
+             refuses, keep the tree and report its reason"
+        )));
     }
     if prog == "git" {
         if git_push_force_in_args(args) {
@@ -1188,6 +1320,94 @@ mod tests {
         }
     }
 
+    fn wt_words(cmd: &str) -> Vec<String> {
+        cmd.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn rules_deny_wt_guard_bypass_variants() {
+        let rules = Rules::default();
+        for cmd in [
+            "wt remove --no-hooks",
+            "wt remove --no-hooks --foreground row-x",
+            "wt remove row-x --foreground --no-hooks",
+            "wt remove --no-verify row-x",
+            "wt -C /w/repo remove --no-hooks row-x",
+            "wt -C/w/repo -y -v remove --no-hooks",
+            "wt --no-hooks remove row-x",
+            "/nix/store/x-worktrunk/bin/wt remove --no-hooks",
+            "git wt remove --no-hooks",
+            "git-wt remove --no-hooks",
+            "wt merge --no-hooks",
+            "wt merge main -y --no-verify",
+            "wt step prune --no-hooks",
+            "wt step -C /w/repo prune --no-verify",
+            "wt switch --create row-y --no-hooks",
+            "wt --config /dev/null remove row-x",
+            "wt remove --config=/dev/null row-x",
+            "wt --config-set pre-remove.guard=true remove row-x",
+            "wt --config-set=pre-remove.guard=true merge",
+            "wt --config /dev/null step prune",
+            "WORKTRUNK_CONFIG_PATH=/dev/null wt remove row-x",
+            "WORKTRUNK__PRE_REMOVE__GUARD=true wt remove row-x",
+            "env XDG_CONFIG_HOME=/nonexistent wt remove row-x",
+            "export WORKTRUNK_CONFIG_PATH=/dev/null; wt remove row-x",
+            "cd /w/repo && wt remove --no-hooks",
+            "cd /w/repo;wt remove --no-hooks",
+            "(wt remove --no-hooks)",
+            "timeout 60 wt remove --no-hooks",
+        ] {
+            let got = rules_verdict(&wt_words(cmd), &rules, test_root());
+            assert!(
+                matches!(&got, Some(Verdict::Block(m)) if m.contains("worktree guard")),
+                "{cmd}: {got:?}"
+            );
+        }
+        let script: Vec<String> = vec![
+            "bash".into(),
+            "-lc".into(),
+            "cd x && wt remove --no-hooks".into(),
+        ];
+        assert!(matches!(
+            rules_verdict(&script, &rules, test_root()),
+            Some(Verdict::Block(_))
+        ));
+    }
+
+    #[test]
+    fn rules_pass_wt_that_keeps_the_guard() {
+        let rules = Rules::default();
+        for cmd in [
+            "wt remove --foreground row-x",
+            "wt remove --force row-x",
+            "wt merge -y",
+            "wt step prune --dry-run",
+            "wt -C /w/repo switch row-x",
+            "wt switch --create row-y --no-cd",
+            "wt switch row-y -x tool -- --no-hooks",
+            "wt step commit --no-hooks",
+            "wt list --config-set list.full=true",
+            "WORKTRUNK_VERBOSE=1 wt remove row-x",
+            "wt remove row-x && git commit --no-verify -m x",
+            "git push --no-verify",
+            "rg -- --no-hooks wt",
+        ] {
+            let got = rules_verdict(&wt_words(cmd), &rules, test_root());
+            assert!(
+                !matches!(&got, Some(Verdict::Block(m)) if m.contains("worktree guard")),
+                "{cmd}: {got:?}"
+            );
+        }
+        let message: Vec<String> = vec![
+            "git".into(),
+            "commit".into(),
+            "-m".into(),
+            "deny wt remove --no-hooks".into(),
+        ];
+        let got = rules_verdict(&message, &rules, test_root());
+        assert!(!matches!(got, Some(Verdict::Block(_))), "{got:?}");
+    }
+
     #[test]
     fn allowlist_bypasses_need_jev() {
         let rules = Rules::default();
@@ -1442,7 +1662,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    rules_verdict(&words(cmd), &rules, test_root()),
+                    rules_verdict(&wt_words(cmd), &rules, test_root()),
                     Some(Verdict::Block(_))
                 ),
                 "{cmd}"
@@ -1507,7 +1727,7 @@ mod tests {
         let rules = Rules::default();
         let cmd = r#"nix build --override-input platform "git+ssh://git@gitlab.com/advait-os/advait?ref=main&rev=abc&submodules=1" .#x"#;
         assert!(
-            rules_verdict(&words(cmd), &rules, test_root()).is_none(),
+            rules_verdict(&wt_words(cmd), &rules, test_root()).is_none(),
             "{cmd}"
         );
     }
@@ -1525,7 +1745,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    rules_verdict(&words(cmd), &rules, test_root()),
+                    rules_verdict(&wt_words(cmd), &rules, test_root()),
                     Some(Verdict::Block(_))
                 ),
                 "{cmd}"
@@ -1552,7 +1772,7 @@ mod tests {
             "echo --option min-free 0",
         ] {
             assert!(
-                rules_verdict(&words(cmd), &rules, test_root()).is_none(),
+                rules_verdict(&wt_words(cmd), &rules, test_root()).is_none(),
                 "{cmd}"
             );
         }

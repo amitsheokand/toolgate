@@ -13,7 +13,7 @@ measurement arm.
 | `read.max_lines` | 400 | Deny whole-file reads without offset/limit |
 | `glob.require_path_scope` | true | Deny unscoped glob at repo root |
 | `grep.require_path_scope` | false | Same for grep when enabled |
-| `shell` | built-in deny/allow prefixes | Deny dangerous argv (see `gate::Rules`) |
+| `shell` | built-in deny/allow prefixes | Deny dangerous argv (see `gate::Rules`), including `wt remove/merge/switch/step prune` with `--no-hooks`, `--no-verify`, `--config`, `--config-set` or a config env override |
 | `clip.min_bytes` | 4096 | Head+tail clip + archive large shell/MCP post output |
 | `mode` | enforce | `observe` logs only; never changes harness I/O |
 
